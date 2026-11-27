@@ -57,6 +57,14 @@ CASES = [
     (LOCAL, "ssh marvin 'bash -lc \"torchrun x.py\"'", "deny"),
     (LOCAL, "ssh marvin 'bash -l -c \"find /lustre/scratch/data -name x\"'", "deny"),
     (LOCAL, "ssh baf 'bash -lc \"echo \\$BUDDY\"'", None),
+    # multi-line commands: every line is checked (2026-11-27)
+    (LOCAL, "echo hi\nssh marvin 'torchrun train.py'", "deny"),
+    (LOCAL, "ssh marvin \\\n  'torchrun train.py'", "deny"),
+    (LOCAL, "# torchrun in a comment\nssh marvin 'squeue --me'", None),
+    (LOGIN, "cd ~/x\ntorchrun train.py", "deny"),
+    (LOGIN, "echo 'line one\ntorchrun is only text'", None),
+    (LOGIN, "cat > notes.txt <<'EOF'\ntorchrun train.py\nEOF", None),      # here-document body is data
+    (LOGIN, "bash -s <<'EOF'\ntorchrun train.py\nEOF", "deny"),             # ...unless a shell runs it
     (LOGIN, "find /cephfs/user/me/logs -maxdepth 1 -name 'out-*' | xargs tail -n 5", None),
     (INJOB, "torchrun train.py", None),
     (INJOB, "python train.py", None),
@@ -118,6 +126,25 @@ LIMIT_CASES = [
     (REMOTE, "", 0, JDL % (2, "", "1"), "ssh baf 'bash -lc \"cd {d} && condor_submit {b}\"'", None),
     (REMOTE, "", 0, JDL % (3, "", "1"), "ssh baf 'bash -lc \"cd {d} && condor_submit {b}\"'", "ask"),
     (REMOTE, "2 2\n", 0, JDL % (1, "", "1"), "ssh baf 'bash -lc \"cd {d} && condor_submit {b}\"'", "ask"),
+    # cd outside the login shell: the directory carries into `bash -lc "..."` (2026-11-27)
+    (REMOTE, "", 0, JDL % (2, "", "1"), "ssh baf 'cd {d} && bash -lc \"condor_submit {b}\"'", None),
+    (REMOTE, "", 0, JDL % (3, "", "1"), "ssh baf 'cd {d} && bash -lc \"condor_submit {b}\"'", "ask"),
+    # newlines separate commands: an ssh call on a later line is still seen
+    (REMOTE, "", 0, JDL % (3, "", "1"), "echo prepare\nssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, JDL % (2, "", "1"), "echo prepare\nssh baf 'cd {d} && condor_submit {b}'", None),
+    (REMOTE, "", 0, JDL % (3, "", "1"), "# a comment\nssh baf \\\n  'cd {d} && condor_submit {b}'", "ask"),
+    # submit file written by a here-document in the same command: its content is read
+    (REMOTE, "", 0, None, "ssh baf 'cd {d} && cat > new.jdl <<EOF\nrequest_gpus = 8\nqueue\nEOF\nbash -lc \"condor_submit new.jdl\"'", "ask"),
+    (REMOTE, "", 0, None, "ssh baf 'cd {d} && cat > new.jdl <<EOF\nrequest_gpus = 1\nqueue\nEOF\nbash -lc \"condor_submit new.jdl\"'", None),
+    (REMOTE, "", 0, None, "ssh baf 'cd {d} && cat <<\"EOF\" > new.jdl\nrequest_gpus = 0\nqueue 500\nEOF\ncondor_submit new.jdl'", "ask"),
+    # written some other way in the same command: content unknown -> ask
+    (REMOTE, "", 0, JDL % (0, "", "1"), "ssh baf 'cd {d} && sed s/x/y/ {b} > new.jdl && condor_submit new.jdl'", "ask"),
+    # the remote script arrives on stdin
+    (REMOTE, "", 0, JDL % (3, "", "1"), "ssh baf bash -s <<'EOF'\ncd {d}\ncondor_submit {b}\nEOF", "ask"),
+    (REMOTE, "", 0, JDL % (1, "", "1"), "ssh baf bash -s <<'EOF'\ncd {d}\ncondor_submit {b}\nEOF", None),
+    # a GPU request the hook cannot evaluate asks
+    (REMOTE, "", 0, "executable = run.sh\nrequest_gpus = $(N)\nqueue\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, None, "ssh marvin 'cd {d} && cat > big.sh <<EOF\n#!/bin/bash\n#SBATCH -p sgpu_short\n#SBATCH --gpus=8\nEOF\nsbatch big.sh'", "ask"),
     (QUIET, "", 0, SBATCH % "", "sbatch {f}", None),
     (QUIET, "", 0, SBATCH % "#SBATCH --array=0-199", "sbatch {f}", "ask"),
     (QUIET, "", 0, SBATCH % "#SBATCH --array=0-39%10", "sbatch {f}", None),

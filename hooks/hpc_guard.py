@@ -136,19 +136,100 @@ def respond(decision, reason):
     sys.exit(0)
 
 
+HEREDOC_MARK = "__hpcguard_heredoc_%d__"
+HEREDOC_OP = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([A-Za-z_][\w.-]*))")
+SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
+
+
+def split_heredocs(cmd):
+    """Take here-document bodies (outside quotes) out of a command line.
+
+    Returns the command with each body replaced by a marker token right after its
+    delimiter (HEREDOC_MARK % index), and the list of bodies. Also drops comments
+    and joins backslash-newline continuations, so that newlines can act as
+    command separators afterwards."""
+    out, bodies, pending = [], [], []
+    i, n, quote = 0, len(cmd), None
+    while i < n:
+        c = cmd[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(" " if cmd[i + 1] == "\n" else cmd[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|("):
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j  # keep the newline itself
+            continue
+        elif cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            m = HEREDOC_OP.match(cmd, i)
+            if m:
+                word = next((g for g in m.groups()[1:] if g is not None), "")
+                out.append(cmd[i:m.end()] + " " + HEREDOC_MARK % len(bodies) + " ")
+                pending.append((len(bodies), word, m.group(1) == "-"))
+                bodies.append("")
+                i = m.end()
+                continue
+        elif c == "\n" and pending:
+            out.append(c)
+            i += 1
+            for idx, word, tabs in pending:
+                lines = []
+                while i < n:
+                    j = cmd.find("\n", i)
+                    j = n if j < 0 else j
+                    line, i = cmd[i:j], j + 1
+                    if (line.lstrip("\t") if tabs else line) == word:
+                        break
+                    lines.append(line)
+                bodies[idx] = "\n".join(lines)
+            pending = []
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), bodies
+
+
+def heredoc_body(tok, bodies):
+    m = re.match(r"^__hpcguard_heredoc_(\d+)__$", tok)
+    return bodies[int(m.group(1))] if m and int(m.group(1)) < len(bodies) else None
+
+
+def without_heredocs(tokens, bodies):
+    """(tokens minus every `<<` DELIM MARKER triple, body of the first here-document or None)."""
+    marks = [k for k, t in enumerate(tokens) if heredoc_body(t, bodies) is not None]
+    drop = {j for k in marks for j in (k - 2, k - 1, k)}
+    rest = [t for j, t in enumerate(tokens) if j not in drop]
+    return rest, (heredoc_body(tokens[marks[0]], bodies) if marks else None)
+
+
 def tokenize(cmd):
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    """Shell-ish tokens; a newline outside quotes is its own token (a separator)."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
     lex.whitespace_split = True
+    lex.commenters = ""  # comments are removed by split_heredocs
     try:
         return list(lex)
     except ValueError:
-        return cmd.split()
+        return re.findall(r"\n|[^\s]+", cmd)
 
 
 def segments(tokens):
     seg = []
     for tok in tokens:
-        if tok and set(tok) <= set(";&|()"):
+        if tok and set(tok) <= set(";&|()\n"):
             if seg:
                 yield seg
             seg = []
@@ -174,8 +255,11 @@ def strip_prefix(seg):
     return seg[i:]
 
 
-def ssh_remote(seg):
-    """For `ssh [opts] host cmd...` return (host, remote command string)."""
+def ssh_remote(seg, bodies=()):
+    """For `ssh [opts] host cmd...` return (host, target, remote command string).
+
+    A here-document fed to a bare remote shell (`ssh host bash -s <<EOF`, or
+    `ssh host <<EOF`) is the remote command."""
     i = 1
     while i < len(seg):
         tok = seg[i]
@@ -185,7 +269,19 @@ def ssh_remote(seg):
             break
     if i >= len(seg):
         return None, None, ""
-    return seg[i].split("@")[-1], seg[i], " ".join(seg[i + 1:])
+    rest, stdin = without_heredocs(seg[i + 1:], bodies)
+    remote = " ".join(rest)
+    if stdin is not None and (not rest or os.path.basename(rest[0]) in SHELLS):
+        remote = stdin
+    return seg[i].split("@")[-1], seg[i], remote
+
+
+def redirect_targets(seg):
+    """Files a segment writes with > / >> / tee."""
+    out = [seg[k + 1] for k, t in enumerate(seg[:-1]) if t in (">", ">>", ">|", "&>", "&>>")]
+    if seg and os.path.basename(seg[0]) == "tee":
+        out += [a for a in seg[1:] if not a.startswith("-")]
+    return out
 
 
 def has_flag(args, letters, longs=()):
@@ -202,6 +298,9 @@ class Verdict:
         self.deny = None
         self.ask = None
         self.submits = []  # (program, args, ssh target or None, working dir or None)
+        # files written earlier in the same command: (ssh target, shell path) ->
+        # here-document content, or None when written some other way
+        self.written = {}
 
     def set_deny(self, msg):
         self.deny = self.deny or msg
@@ -210,8 +309,9 @@ class Verdict:
         self.ask = self.ask or msg
 
 
-def check(cmd, login, verdict, depth=0, host=None):
-    """login: True when the command would run on a login node."""
+def check(cmd, login, verdict, depth=0, host=None, cwd=None):
+    """login: True when the command would run on a login node. cwd: the directory a
+    preceding `cd` moved to (carried into nested `bash -c` strings)."""
     if depth > 3:
         return
     if ANACONDA.search(cmd):
@@ -233,33 +333,40 @@ def check(cmd, login, verdict, depth=0, host=None):
             "HTCondor cluster (`queue N` with `max_materialize`) instead."
         )
 
-    cwd = None
-    for raw in segments(tokenize(cmd)):
+    stripped, bodies = split_heredocs(cmd)
+    for raw in segments(tokenize(stripped)):
         seg = strip_prefix(raw)
         if not seg:
             continue
         prog, args = os.path.basename(seg[0]), seg[1:]
 
+        plain, inline = without_heredocs(seg, bodies)
+        for target in redirect_targets(seg):
+            verdict.written[(host, shell_path(target, cwd))] = inline
+
         if prog == "cd" and args:
-            cwd = args[0]
+            cwd = args[0] if args[0].startswith(("/", "~", "$")) or not cwd else cwd.rstrip("/") + "/" + args[0]
             continue
         if prog == "ssh":
-            name, target, remote = ssh_remote(seg)
+            name, target, remote = ssh_remote(seg, bodies)
             if name and remote and re.search(SSH_HOSTS, name):
                 check(remote, True, verdict, depth + 1, target)
             continue
         cflag = next(
             (i for i, a in enumerate(args) if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a)), None
         )  # -c, and combined forms such as -lc / -ic
-        if prog in ("bash", "sh", "zsh", "dash", "ksh") and cflag is not None:
+        if prog in SHELLS and cflag is not None:
             idx = cflag
             if idx + 1 < len(args):
-                check(args[idx + 1], login, verdict, depth + 1, host)
+                check(args[idx + 1], login, verdict, depth + 1, host, cwd)
+            continue
+        if prog in SHELLS and inline is not None and not [a for a in plain[1:] if not a.startswith("-")]:
+            check(inline, login, verdict, depth + 1, host, cwd)  # `bash -s <<EOF`
             continue
         if prog == "xargs":
             rest = [a for a in args if not a.startswith("-")]
             if rest:
-                check(" ".join(shlex.quote(a) for a in rest), login, verdict, depth + 1, host)
+                check(" ".join(shlex.quote(a) for a in rest), login, verdict, depth + 1, host, cwd)
             continue
 
         if prog == "watch" and any(os.path.basename(a) in QUERY for a in args):
@@ -462,16 +569,35 @@ def gpu_count(value):
     return int(m.group(1)) if m else None
 
 
-def slurm_limits(args, host, cwd, verdict):
+WRITTEN_HERE = (
+    "The job file %s is written by this same command, so the hook cannot read its resource "
+    "request before it exists. Write the file in one command and submit it in the next (or "
+    "write it with a here-document, which the hook reads)."
+)
+
+
+def same_command_file(path, host, cwd, written):
+    """False: not written by this command. None: written, content unknown. Else the content."""
+    if not path:
+        return False
+    return (written or {}).get((host, shell_path(path, cwd)), False)
+
+
+def slurm_limits(args, host, cwd, verdict, written=None):
     path = job_file(args)
+    inline = same_command_file(path, host, cwd, written)
+    if inline is None:
+        verdict.set_ask(WRITTEN_HERE % path)
     script = (
         "command -v squeue >/dev/null && squeue --me -h -r -t PD,R,S,CF,RQ,RS "
         "-O Partition:60,tres-alloc:300 && echo @@ok"
     )
-    if path:
+    if path and inline is False:
         script += "; test -r {0} && echo @@readable; grep -E '^#SBATCH' {0} 2>/dev/null".format(shell_path(path, cwd))
     out = probe(host, script)
     queue_text, _, directives = (out or "").partition("@@ok")
+    if inline:
+        directives = "@@readable\n" + "\n".join(l for l in inline.splitlines() if l.startswith("#SBATCH"))
     readable = "@@readable" in directives
     directives = "\n".join(l.strip()[len("#SBATCH"):] for l in directives.splitlines() if l.strip().startswith("#SBATCH"))
     texts = (" ".join(args), directives)  # command line overrides the script
@@ -611,15 +737,21 @@ def condor_test_gate(text, args, host, gpus, verdict):
         )
 
 
-def condor_limits(args, host, cwd, verdict):
+CONDOR_KEYS = r"^[[:space:]]*(request_gpus|queue|max_materialize|[+]?MaxRuntimeHours|[+]?JobBatchName|batch_name)"
+
+
+def condor_limits(args, host, cwd, verdict, written=None):
     path = job_file(args)
+    inline = same_command_file(path, host, cwd, written)
+    if inline is None:
+        verdict.set_ask(WRITTEN_HERE % path)
     script = 'command -v condor_q >/dev/null || exit 1; condor_q -global "$USER" -af JobStatus RequestGPUs 2>/dev/null; echo @@ok'
-    if path:
-        script += (
-            "; grep -iE '^[[:space:]]*(request_gpus|queue|max_materialize|[+]?MaxRuntimeHours"
-            "|[+]?JobBatchName|batch_name)' %s 2>/dev/null" % shell_path(path, cwd)
-        )
+    if path and inline is False:
+        script += "; grep -iE '%s' %s 2>/dev/null" % (CONDOR_KEYS, shell_path(path, cwd))
     out = probe(host, script)
+    if out is not None and inline:
+        keys = re.compile(CONDOR_KEYS.replace("[[:space:]]", r"\s"), re.I)
+        out = out.partition("@@ok")[0] + "@@ok\n" + "\n".join(l for l in inline.splitlines() if keys.match(l))
     if out is None:
         verdict.set_ask(
             "Could not check how many GPUs and jobs you currently hold. Run "
@@ -632,9 +764,11 @@ def condor_limits(args, host, cwd, verdict):
     held_gpus = sum(int(g) for g in active if g.isdigit())
 
     text = file_text + "\n" + "\n".join(args)  # -append values come last and win
-    gpus = re.findall(r"(?im)^\s*request_gpus\s*=\s*(\d+)", text)
-    if gpus:
+    gpus = re.findall(r"(?im)^\s*request_gpus\s*=\s*(\S*)", text)
+    if gpus and gpus[-1].isdigit():
         new_gpus = int(gpus[-1])
+    elif gpus:
+        new_gpus = None  # a macro or variable, e.g. request_gpus = $(N)
     elif path and not file_text.strip():
         new_gpus = None  # submit file not readable from here
     else:
@@ -663,7 +797,7 @@ def condor_limits(args, host, cwd, verdict):
         )
     if new_gpus is None:
         verdict.set_ask(
-            "Could not read the submit file to see how many GPUs it requests; you currently hold "
+            "Could not read from the submit file how many GPUs it requests; you currently hold "
             "%d. Confirm this submission with the user." % held_gpus
         )
     elif new_gpus > 0 and held_gpus + new_gpus * concurrent > GPU_BUDGET:
@@ -693,10 +827,11 @@ def main():
         check(cmd, not in_job, verdict)
     else:
         # Off-cluster: only ssh calls to a cluster are of interest.
-        for raw in segments(tokenize(cmd)):
+        stripped, bodies = split_heredocs(cmd)
+        for raw in segments(tokenize(stripped)):
             seg = strip_prefix(raw)
             if seg and os.path.basename(seg[0]) == "ssh":
-                name, target, remote = ssh_remote(seg)
+                name, target, remote = ssh_remote(seg, bodies)
                 if name and remote and re.search(SSH_HOSTS, name):
                     check(remote, True, verdict, 1, target)
 
@@ -705,9 +840,9 @@ def main():
         rate_limit(len(verdict.submits), limits)
         for prog, args, host, cwd in verdict.submits:
             if prog == "sbatch":
-                slurm_limits(args, host, cwd, limits)
+                slurm_limits(args, host, cwd, limits, verdict.written)
             elif prog == "condor_submit":
-                condor_limits(args, host, cwd, limits)
+                condor_limits(args, host, cwd, limits, verdict.written)
         if limits.ask:
             verdict.ask = limits.ask  # more specific than the generic confirmation
 

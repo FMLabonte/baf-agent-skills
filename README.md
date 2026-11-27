@@ -103,7 +103,7 @@ flowchart TD
 ## 4. What is enforced by the program
 
 Applies to commands sent to BAF over `ssh`. Source: [`hooks/hpc_guard.py`](hooks/hpc_guard.py);
-its 139 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
+its 159 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
 
 | The agent tries to | Result |
 |---|---|
@@ -122,7 +122,8 @@ its 139 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
 | Remove its own jobs by ID (checked against the `ClaudeAgent` job attribute) | Allowed |
 | Submit inside all limits | Allowed |
 
-The same checks apply inside `bash -c` / `bash -lc` and behind wrappers such
+The same checks apply on every line of a multi-line command, in scripts
+passed to a remote shell by here-document, inside `bash -c` / `bash -lc` and behind wrappers such
 as `nohup`, `env`, `nice` and `timeout`. If the hook cannot query the
 scheduler, it asks the user.
 
