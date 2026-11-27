@@ -135,6 +135,15 @@ job above 48 hours whose test run is on record, one `condor_history` call
 with `-limit 1` that scans back no further than that test's submission.
 Nothing runs periodically.
 
+### Known gap (TODO): CPU, memory and node requests are not limited
+
+The hook limits GPUs, the number of submissions and queued jobs, and long
+runtimes. It does **not** look at `request_cpus` or `request_memory`. Checked
+on 2026-11-27: a CPU-only submission of 20 jobs with 192 CPUs and 1 TB of RAM
+each, for 48 hours, passed without a prompt. Sensible behaviour for CPU-heavy
+work is not defined yet; until it is, only the written "request the minimum"
+rule applies. This is the main reason the skill is not ready for wider use.
+
 **Not enforced, only written rules** (the agent is told to, nothing checks):
 the Kerberos ticket check, machine health check, requesting the fewest GPUs,
 verifying GPU use, never setting `CUDA_VISIBLE_DEVICES`, file-count hygiene on
@@ -214,8 +223,11 @@ which was marked unhealthy that day.
    gateway. Is that what you want, and on which machines?
 9. **Unhealthy nodes.** When a GPU machine is marked unhealthy, should users
    leave jobs queued or hold off submitting?
-10. **Anything wrong or outdated** in `skills/baf/SKILL.md`, and any of the
-    settings in section 5 that seem unreasonable to you.
+10. **CPU limits.** Nothing in our tooling limits CPU or memory requests yet
+    (see the known gap in section 4). What would you consider reasonable
+    ceilings for one user's agent on BAF: cores, memory, number of jobs?
+11. **Anything wrong or outdated** in `skills/baf/SKILL.md`, and any of the
+     settings in section 5 that seem unreasonable to you.
 
 ## 8. Trying it yourself
 

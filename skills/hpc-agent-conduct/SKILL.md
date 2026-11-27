@@ -135,6 +135,11 @@ quota.
   or batch does not fit in one GPU's memory, or a measured speed-up the user
   needs), and say that reason when you submit. A job holding four GPUs and
   running on one blocks three for everyone.
+- **CPU, memory and node requests are not checked by the guard hook** (open
+  TODO; no ceilings are agreed yet). "Request the minimum" applies to them
+  just as much: ask for the cores, memory and nodes the job demonstrably
+  uses, never a whole node or `--exclusive` by habit, and state the totals
+  (nodes x cores, memory, number of tasks) whenever you report a submission.
 - **Verify every requested GPU is used** in the first minutes: per-GPU
   utilisation and memory from `nvidia-smi` (on shared nodes, only the rows
   for your own GPUs). If some sit idle, the launch is wrong (for example
