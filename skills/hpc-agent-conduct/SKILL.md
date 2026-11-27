@@ -194,6 +194,12 @@ When the hook asks anyway, read its reason before involving the user:
   submit file ..."* or *"Could not work out how many GPUs ..."*: your command
   shape is the problem (or the file is missing, or uses a macro for GPUs). Split it as above and
   retry; do not ask the user to approve it.
+- *"Could not check how many jobs and GPUs you already have/hold"*: the hook
+  could not reach the scheduler at all. That is neither your command's shape
+  nor a limit, so retrying or splitting will not help. Check the connection
+  once (`ssh <cluster> true`; on BAF also `klist`, since an expired ticket
+  looks the same), tell the user what you found, and submit only when the
+  check works again.
 - A **limit** (GPU budget, submissions per hour, queue size, uncapped array,
   missing test run): that is a real decision. Stop, tell the user the
   numbers, and wait.
