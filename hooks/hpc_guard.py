@@ -276,6 +276,26 @@ def ssh_remote(seg, bodies=()):
     return seg[i].split("@")[-1], seg[i], remote
 
 
+# Programs that do not change the files named in their arguments. Anything else
+# (sed -i, cp, mv, python gen.py job.sh, an editor, ...) may have rewritten a file
+# the hook is about to read, so a file it names counts as "content unknown".
+LEAVES_FILES_ALONE = {
+    "cat", "ls", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "wc", "stat", "test", "[",
+    "echo", "printf", "cd", "pwd", "mkdir", "chmod", "chown", "chgrp", "file", "diff", "cmp",
+    "md5sum", "sha256sum", "du", "df", "find", "tee", "module", "source", ".", "export", "true",
+    "false", "sleep", "date", "hostname", "which", "type", "klist", "screen", "ssh", "nvidia-smi",
+}
+COPIES_TO_LAST = {"cp", "mv", "install", "ln", "scp", "rsync"}
+
+
+def modified_paths(prog, args):
+    """Paths in args whose content this command may change."""
+    if prog in LEAVES_FILES_ALONE or prog in JOB_CONTROL or prog in QUERY or prog in SHELLS:
+        return []
+    paths = [a for a in args if a and not a.startswith("-") and a not in (">", ">>", ">|", "<", "&>", "&>>")]
+    return paths[-1:] if prog in COPIES_TO_LAST else paths
+
+
 def redirect_targets(seg):
     """Files a segment writes with > / >> / tee."""
     out = [seg[k + 1] for k, t in enumerate(seg[:-1]) if t in (">", ">>", ">|", "&>", "&>>")]
@@ -341,6 +361,8 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
         prog, args = os.path.basename(seg[0]), seg[1:]
 
         plain, inline = without_heredocs(seg, bodies)
+        for touched in modified_paths(prog, plain[1:]):
+            verdict.written[(host, shell_path(touched, cwd))] = None
         for target in redirect_targets(seg):
             verdict.written[(host, shell_path(target, cwd))] = inline
 
@@ -570,8 +592,8 @@ def gpu_count(value):
 
 
 WRITTEN_HERE = (
-    "The job file %s is written by this same command, so the hook cannot read its resource "
-    "request before it exists. Write the file in one command and submit it in the next (or "
+    "The job file %s is written or changed by this same command, so the hook cannot know its "
+    "resource request. Write or edit the file in one command and submit it in the next (or "
     "write it with a here-document, which the hook reads)."
 )
 
@@ -808,6 +830,56 @@ def condor_limits(args, host, cwd, verdict, written=None):
         )
 
 
+SCP_ARG_OPTS = set("cFiJloPSX")
+
+
+def local_path(path, base):
+    return os.path.normpath(os.path.join(base, os.path.expanduser(path)))
+
+
+def record_copy(prog, args, local_dir, local_written, verdict):
+    """`scp|rsync SRC... host:DEST` to a cluster: note DEST as written by this command,
+    with the content of SRC (from a here-document in this command, or read from local
+    disk), or None when SRC cannot be read here."""
+    paths, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and len(a) > 1:
+            if prog == "scp" and len(a) == 2 and a[1] in SCP_ARG_OPTS:
+                i += 1
+            elif prog == "rsync" and a in ("-e", "--rsh"):
+                i += 1
+        else:
+            paths.append(a)
+        i += 1
+    if len(paths) < 2:
+        return
+    m = re.match(r"^(?:[^@/:]+@)?([^/:]+):(.*)$", paths[-1])
+    if not m or not re.search(SSH_HOSTS, m.group(1)):
+        return
+    host, dest = paths[-1].split(":", 1)[0], m.group(2)
+    if dest and not dest.startswith(("/", "~")):
+        dest = "~/" + dest  # scp destinations are relative to the remote home
+    for src in paths[:-1]:
+        if re.match(r"^[^/]+:", src):
+            continue  # remote source
+        lp = local_path(src, local_dir)
+        content = local_written.get(lp, False)
+        if content is False:
+            try:
+                with open(lp, errors="replace") as fh:
+                    content = fh.read(1 << 20)
+            except OSError:
+                content = None
+        name = os.path.basename(lp)
+        if not dest or dest.endswith("/") or dest in ("~", "."):
+            targets = [(dest or "~/").rstrip("/") + "/" + name]
+        else:
+            targets = [dest, dest.rstrip("/") + "/" + name]  # DEST may be a directory
+        for t in targets:
+            verdict.written[(host, shell_path(t, None))] = content
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -826,14 +898,29 @@ def main():
     if on_cluster:
         check(cmd, not in_job, verdict)
     else:
-        # Off-cluster: only ssh calls to a cluster are of interest.
+        # Off-cluster: ssh calls to a cluster, plus files copied there with
+        # scp/rsync in the same command (read locally, since the copy has not
+        # happened yet when the hook runs).
+        local_dir = payload.get("cwd") or os.getcwd()
+        local_written = {}
         stripped, bodies = split_heredocs(cmd)
         for raw in segments(tokenize(stripped)):
             seg = strip_prefix(raw)
-            if seg and os.path.basename(seg[0]) == "ssh":
+            if not seg:
+                continue
+            plain, inline = without_heredocs(seg, bodies)
+            prog = os.path.basename(seg[0])
+            if prog not in ("scp", "rsync"):
+                for touched in modified_paths(prog, plain[1:]):
+                    local_written[local_path(touched, local_dir)] = None
+            for target in redirect_targets(seg):
+                local_written[local_path(target, local_dir)] = inline
+            if prog == "ssh":
                 name, target, remote = ssh_remote(seg, bodies)
                 if name and remote and re.search(SSH_HOSTS, name):
                     check(remote, True, verdict, 1, target)
+            elif prog in ("scp", "rsync"):
+                record_copy(prog, plain[1:], local_dir, local_written, verdict)
 
     if verdict.submits and not verdict.deny:
         limits = Verdict()

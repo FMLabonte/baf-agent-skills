@@ -145,6 +145,24 @@ LIMIT_CASES = [
     # a GPU request the hook cannot evaluate asks
     (REMOTE, "", 0, "executable = run.sh\nrequest_gpus = $(N)\nqueue\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
     (REMOTE, "", 0, None, "ssh marvin 'cd {d} && cat > big.sh <<EOF\n#!/bin/bash\n#SBATCH -p sgpu_short\n#SBATCH --gpus=8\nEOF\nsbatch big.sh'", "ask"),
+    # job file copied with scp/rsync in the same command: read from the local source
+    (REMOTE, "", 0, SBATCH % "", "scp -q {f} marvin:conntest/revtest.sh && ssh marvin 'cd ~/conntest && sbatch revtest.sh'", None),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=8", "scp -q {f} marvin:{d}/copy.sh\nssh marvin 'cd {d} && sbatch copy.sh'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "rsync -a {f} marvin:{d}/sub/ && ssh marvin 'cd {d}/sub && sbatch job.sh'", None),
+    (REMOTE, "", 0, None, "cat > {d}/local.jdl <<'EOF'\nrequest_gpus = 8\nqueue\nEOF\nscp {d}/local.jdl baf:{d}/remote.jdl && ssh baf 'cd {d} && condor_submit remote.jdl'", "ask"),
+    (REMOTE, "", 0, None, "cat > {d}/local.jdl <<'EOF'\nrequest_gpus = 0\nqueue\nEOF\nscp {d}/local.jdl baf:{d}/remote.jdl && ssh baf 'cd {d} && condor_submit remote.jdl'", None),
+    (REMOTE, "", 0, None, "scp /nonexistent/x.sh marvin:{d}/x.sh && ssh marvin 'cd {d} && sbatch x.sh'", "ask"),
+    # a job file changed in the same command (not by a redirect) is "content unknown" -> ask
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "sed -i 's/--gpus=1/--gpus=8/' {f} && scp {f} marvin:{d}/c.sh && ssh marvin 'cd {d} && sbatch c.sh'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "cp {d}/other.sh {f} && scp {f} marvin:{d}/c.sh && ssh marvin 'cd {d} && sbatch c.sh'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "ssh marvin 'cd {d} && sed -i s/--gpus=1/--gpus=8/ {b} && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "ssh marvin 'cd {d} && cp other.sh {b} && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "ssh marvin 'cd {d} && python3 make_job.py {b} && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, JDL % (1, "", "1"), "ssh baf 'cd {d} && sed -i s/=.1/=.8/ {b} && condor_submit {b}'", "ask"),
+    # ...but reading it, or copying it elsewhere, is not a change
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "ssh marvin 'cd {d} && chmod +x {b} && mkdir -p logs && cat {b} && sbatch {b}'", None),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "ssh marvin 'cd {d} && cp {b} backup.sh && sbatch {b}'", None),
+    (REMOTE, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gpus=1", "scp {f} marvin:{d}/c.sh && ssh marvin 'cd {d} && chmod +x c.sh && sbatch c.sh'", None),
     (QUIET, "", 0, SBATCH % "", "sbatch {f}", None),
     (QUIET, "", 0, SBATCH % "#SBATCH --array=0-199", "sbatch {f}", "ask"),
     (QUIET, "", 0, SBATCH % "#SBATCH --array=0-39%10", "sbatch {f}", None),
