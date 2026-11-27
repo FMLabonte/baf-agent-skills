@@ -161,6 +161,43 @@ quota.
   open their own connection.
 - Long jobs must checkpoint and be able to resume.
 
+### Write submit commands the guard hook can read
+
+The guard hook checks every submission **before the command runs**: it reads
+the job file to count GPUs, tasks and runtime. A command it cannot read is
+sent to the user for approval even when the job is small, which stops
+autonomous work. Shape submissions so they pass on their own:
+
+- **The job file must exist before the submitting command runs.** Create,
+  edit, copy or generate it in one tool call (Write, `scp`, `sed`, `cp`, ...),
+  and submit in the **next** call. Never `sed ... > job.jdl && condor_submit
+  job.jdl`, `cp a.sh job.sh && sbatch job.sh` or `python gen.py && sbatch
+  job.sh` in one command: the hook treats a file changed by the same command
+  as unknown and asks.
+- Two same-command forms the hook can read: a **here-document** that writes
+  the file (`cat > job.jdl <<'EOF' ... EOF`, then submit), or an `scp`/`rsync`
+  of an **unchanged local file** followed by the submit (the hook reads the
+  local copy).
+- **Literal resource numbers** in the file or on the command line:
+  `request_gpus = 1`, `--gpus=1`, `queue 10`. No `$(N)` macros or shell
+  variables for GPUs, tasks or `MaxRuntimeHours`.
+- **One submit per command**, never in a loop (use an array or `queue N`
+  with a cap). Name the file explicitly: `cd <dir> && condor_submit job.jdl`
+  or an absolute path, inside or outside `bash -lc "..."`.
+- Keep other work (copying outputs, waiting, reading logs) out of the
+  submitting command where you can; a short submit command is easy for the
+  user to review if it does get asked.
+
+When the hook asks anyway, read its reason before involving the user:
+
+- *"written or changed by this same command"*, *"Could not read from the
+  submit file ..."* or *"Could not work out how many GPUs ..."*: your command
+  shape is the problem (or the file is missing, or uses a macro for GPUs). Split it as above and
+  retry; do not ask the user to approve it.
+- A **limit** (GPU budget, submissions per hour, queue size, uncapped array,
+  missing test run): that is a real decision. Stop, tell the user the
+  numbers, and wait.
+
 ## 6. Software
 
 - Look for a site module first (`module spider <name>`); ask before installing
