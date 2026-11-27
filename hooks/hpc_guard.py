@@ -11,6 +11,14 @@ Decisions:
   ask   submitting/cancelling/holding/releasing jobs, python scripts on a login node,
         recursive deletes on Lustre/CephFS
 
+Submissions fail closed: one passes without a prompt only when the whole
+command was parsed and every submit in it was read. Several submits in one
+command are added up. A submit the hook cannot read (inside quotes, backticks,
+a function, behind an unknown command), a request it cannot count (shell
+variables, SBATCH_* variables, unknown or abbreviated options, macros,
+`include`, a job file on a pipe), a command that may have changed the job file
+first (git pull, tar, a script), or a script that itself submits, asks.
+
 Submission limits. These always ask, even with HPC_GUARD_CONFIRM_JOBS=0, and a
 submit command inside a shell loop is denied outright:
   - more than HPC_GUARD_MAX_SUBMITS_PER_HOUR submit commands in an hour
@@ -100,11 +108,21 @@ SHARED_ROOT = re.compile(
     r"|/cephfs(/user)?|/opt/software|/software|/local/nvme)/?\*?$"
 )
 SHARED_PREFIX = re.compile(r"^(/lustre|/cephfs)/")
+BUDDY_ROOT = re.compile(r"^(\$BUDDY|\$\{BUDDY\}|/cephfs/user/[^/]+)/?$")
 
 COMPUTE = {
     "torchrun", "mpirun", "mpiexec", "orterun", "vllm", "ollama", "tensorboard",
-    "jupyter", "jupyter-lab", "jupyter-notebook", "deepspeed",
+    "jupyter", "jupyter-lab", "jupyter-notebook", "deepspeed", "horovodrun",
+    "text-generation-launcher", "papermill", "dask-scheduler", "dask-worker",
+    "streamlit", "gradio", "uvicorn", "gunicorn", "condor_watch_q",
 }
+# launchers that are only a problem with certain sub-commands
+COMPUTE_SUB = {"accelerate": {"launch"}, "ray": {"start", "up", "submit"}, "lightning": {"run"},
+               "dask": {"scheduler", "worker"}}
+# programs that run another command given as their arguments
+RUNNERS = {"conda", "mamba", "micromamba", "uv", "poetry", "pipenv", "pixi", "hatch", "pdm"}
+CARRIERS = {"tmux", "screen", "sg", "sudo", "su", "script", "numactl", "taskset", "chrt", "xvfb-run", "watch"}
+KEYWORDS = {"then", "else", "elif", "do", "if", "while", "until", "{", "!"}
 QUERY = {"squeue", "sacct", "sinfo", "sstat", "condor_q", "condor_status", "condor_history"}
 JOB_CONTROL = {
     "sbatch", "srun", "salloc", "scancel", "condor_submit", "condor_submit_dag",
@@ -119,10 +137,72 @@ ANACONDA = re.compile(
     r"repo\.anaconda\.com|Anaconda3-|Miniconda3-|module\s+load\s+Anaconda"
     r"|(-c|--channel)[ =]+(defaults|anaconda|main)\b"
 )
-LOOP = re.compile(r"\b(while|until)\b[\s\S]*\bdo\b[\s\S]*\b(%s)\b" % "|".join(sorted(QUERY)))
+_QW = "|".join(sorted(QUERY | {"scontrol"}))
+LOOP = re.compile(r"\b(while|until)\b[\s\S]*\b(%s)\b[\s\S]*\bdone\b" % _QW)   # query in condition or body
+FOR_LOOP = re.compile(r"\bfor\b[\s\S]*\bdo\b[\s\S]*\b(%s)\b[\s\S]*\bdone\b" % _QW)
 SUBMIT_LOOP = re.compile(
-    r"(\b(while|until|for)\b[\s\S]*\bdo\b|\bxargs\b|\bparallel\b)[\s\S]*\b(%s)\b" % "|".join(sorted(SUBMIT))
+    r"(\b(while|until|for)\b[\s\S]*\bdo\b|\bxargs\b|\bparallel\b|-exec(dir)?\b)[\s\S]*\b(%s)\b"
+    % "|".join(sorted(SUBMIT))
 )
+SUBMIT_WORD = re.compile(r"(?<![\w./-])(%s)(?![\w.-])" % "|".join(sorted(SUBMIT)))
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+
+UNREAD_SUBMIT = (
+    "A submit command (sbatch / condor_submit) appears where the hook cannot read it: inside "
+    "quotes, backticks, a variable, a function, or behind a command it does not know. Run the "
+    "submit as a plain command of its own, e.g. `ssh <cluster> 'cd <dir> && sbatch job.sh'`."
+)
+BLIND_WRITER = (
+    "`%s` runs before the submit in the same command and may create or change the job file, so "
+    "the hook cannot know what would be submitted. Run it in a command of its own, then submit."
+)
+
+
+def count_submits(text):
+    return len(SUBMIT_WORD.findall(text))
+
+
+def expand(tok, env):
+    """Replace $NAME / ${NAME} by values assigned earlier in the same command."""
+    def rep(m):
+        v = env.get(m.group(1) or m.group(2))
+        return v if isinstance(v, str) else m.group(0)
+    return VAR.sub(rep, tok)
+
+
+def prefix_env(seg):
+    """NAME=value words in front of the program (or making up the whole segment)."""
+    out = {}
+    for tok in seg:
+        if tok in KEYWORDS or os.path.basename(tok) in WRAPPERS:
+            continue
+        m = ASSIGN.match(tok)
+        if not m:
+            break
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def remember(env, assigns):
+    for k, v in assigns.items():
+        env[k] = None if re.search(r"[$`]", v) else v
+
+
+def loop_rules(text, verdict):
+    """Polling loops and submissions in loops, on the text of one command."""
+    sleeps = [int(x) for x in re.findall(r"\bsleep\s+(\d+)", text)]
+    tight = not sleeps or min(sleeps) < MIN_POLL
+    if (LOOP.search(text) and tight) or (FOR_LOOP.search(text) and sleeps and tight):
+        verdict.set_deny(
+            "Scheduler polling loop. Use `sbatch --wait` / `condor_wait <log>` or read the "
+            "job's log file; if you must loop, sleep at least %d s." % MIN_POLL
+        )
+    if SUBMIT_LOOP.search(text):
+        verdict.set_deny(
+            "Job submission inside a loop. Submit one job array (`--array=0-N%cap`) or one "
+            "HTCondor cluster (`queue N` with `max_materialize`) instead."
+        )
 
 
 def respond(decision, reason):
@@ -244,7 +324,7 @@ def strip_prefix(seg):
     i = 0
     while i < len(seg):
         tok = seg[i]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+        if ASSIGN.match(tok) or tok in KEYWORDS:
             i += 1
         elif os.path.basename(tok) in WRAPPERS:
             i += 1
@@ -286,6 +366,38 @@ LEAVES_FILES_ALONE = {
     "false", "sleep", "date", "hostname", "which", "type", "klist", "screen", "ssh", "nvidia-smi",
 }
 COPIES_TO_LAST = {"cp", "mv", "install", "ln", "scp", "rsync"}
+# Programs that may precede a submit in the same command without making the job
+# file's content unknown. Writers that name their target (sed, cp, ...) are
+# tracked per file by modified_paths; anything not listed here could rewrite
+# files it does not name (git pull, tar, a script), so the submit asks.
+SAFE_BEFORE_SUBMIT = LEAVES_FILES_ALONE | {
+    "sed", "perl", "awk", "gawk", "cp", "mv", "ln", "install",
+    "set", "unset", "umask", "ulimit", ":", "exit", "return", "rm", "rmdir", "touch", "wait",
+    "fi", "done", "}", "esac", "for", "case", "function", "local", "readonly", "declare",
+    "alias", "trap", "shopt", "ml", "id", "whoami", "env", "printenv", "basename", "dirname",
+    "realpath", "readlink", "sort", "uniq", "cut", "tr", "scontrol", "ws_list", "ws_find",
+    "lfs", "getfattr", "bquota", "condor_wait", "condor_tail", "squeue", "sacct", "sinfo",
+}
+
+
+def blind_writer(prog, args):
+    """Name of the program if it could change files it does not name, else None."""
+    if prog in ("conda", "mamba", "micromamba") and args[:1] and args[0] in ("activate", "deactivate"):
+        return None
+    if prog == "git" and next((a for a in args if not a.startswith("-")), "") in (
+        "status", "log", "diff", "show", "branch", "rev-parse", "remote", "describe", "fetch", "ls-files"
+    ):
+        return None
+    if prog in COPIES_TO_LAST:
+        paths = [a for a in args if not a.startswith("-")]
+        dest = paths[-1] if paths else ""
+        many = len(paths) > 2 or any(re.search(r"[*?\[]", a) for a in paths[:-1])
+        if has_flag(args, "rRa", ("--recursive", "--archive")) or dest in (".", "..") or dest.endswith("/") or many:
+            return prog
+        return None
+    if prog in SAFE_BEFORE_SUBMIT or prog in QUERY or prog in JOB_CONTROL:
+        return None
+    return prog
 
 
 def modified_paths(prog, args):
@@ -317,7 +429,9 @@ class Verdict:
     def __init__(self):
         self.deny = None
         self.ask = None
-        self.submits = []  # (program, args, ssh target or None, working dir or None)
+        self.submits = []  # dicts: prog, args, host, cwd, stdin, piped, why
+        self.blind = None  # a program seen so far that may change files it does not name
+        self.scripts = []  # (host, path) of scripts the command runs on the cluster
         # files written earlier in the same command: (ssh target, shell path) ->
         # here-document content, or None when written some other way
         self.written = {}
@@ -329,39 +443,90 @@ class Verdict:
         self.ask = self.ask or msg
 
 
-def check(cmd, login, verdict, depth=0, host=None, cwd=None):
+HARMLESS_MENTION = {"which", "type", "man", "whatis", "apropos", "command", "module", "ml", "grep", "egrep", "rpm", "alias"}
+NOT_A_SUBMISSION = {
+    "sbatch": {"--test-only", "--help", "-h", "--usage", "--version", "-V"},
+    "condor_submit": {"-dry-run", "-help", "-version"},
+    "condor_submit_dag": {"-help", "-version", "-no_submit"},
+}
+
+
+def segments_sep(tokens):
+    """(separator before the segment, segment)."""
+    seg, sep, last = [], "", ""
+    for tok in tokens:
+        if tok and set(tok) <= set(";&|()\n"):
+            if seg:
+                yield sep, seg
+                seg = []
+            last = tok
+        else:
+            if not seg:
+                sep = last
+            seg.append(tok)
+    if seg:
+        yield sep, seg
+
+
+def nested_commands(prog, args):
+    """Command strings that `prog` would run, for programs that run their arguments."""
+    if prog in RUNNERS:
+        if "run" not in args:
+            return []
+        rest, out, skip = args[args.index("run") + 1:], [], False
+        for k, a in enumerate(rest):
+            if skip:
+                skip = False
+            elif a in ("-n", "-p", "--name", "--prefix", "--cwd", "--with", "--python", "--project", "--directory"):
+                skip = True
+            elif not a.startswith("-"):
+                out = rest[k:]
+                break
+        return [" ".join(shlex.quote(a) for a in out)] if out else []
+    if prog in CARRIERS:
+        found = [a for a in args if " " in a.strip()]
+        tail = list(args)
+        while tail and (tail[0].startswith("-") or re.match(r"^\d+(\.\d+)?$", tail[0])):
+            tail.pop(0)
+        if prog in ("tmux", "sg", "su") and tail:
+            tail = tail[1:]  # sub-command, group or user name
+        if tail and not found:
+            found.append(" ".join(shlex.quote(a) for a in tail))
+        return found
+    return []
+
+
+def check(cmd, login, verdict, depth=0, host=None, cwd=None, env=None):
     """login: True when the command would run on a login node. cwd: the directory a
-    preceding `cd` moved to (carried into nested `bash -c` strings)."""
-    if depth > 3:
+    preceding `cd` moved to (carried into nested `bash -c` strings). env: variables
+    assigned earlier in the same command. Returns nothing; fills verdict."""
+    if depth > 4:
+        verdict.set_ask(UNREAD_SUBMIT) if count_submits(cmd) else None
         return
+    env = {} if env is None else env
     if ANACONDA.search(cmd):
         verdict.set_deny(
             "Anaconda, Miniconda and the 'defaults' channel are not allowed on the Bonn "
             "clusters. Use `module load Miniforge3` with conda-forge."
         )
-    if LOOP.search(cmd):
-        sleeps = [int(s) for s in re.findall(r"\bsleep\s+(\d+)", cmd)]
-        if not sleeps or min(sleeps) < MIN_POLL:
-            verdict.set_deny(
-                "Scheduler polling loop. Use `sbatch --wait` / `condor_wait <log>` or read the "
-                "job's log file; if you must loop, sleep at least %d s." % MIN_POLL
-            )
-
-    if SUBMIT_LOOP.search(cmd):
-        verdict.set_deny(
-            "Job submission inside a loop. Submit one job array (`--array=0-N%cap`) or one "
-            "HTCondor cluster (`queue N` with `max_materialize`) instead."
-        )
+    loop_rules(cmd, verdict)
 
     stripped, bodies = split_heredocs(cmd)
-    for raw in segments(tokenize(stripped)):
+    total, accounted, queries = count_submits(stripped), 0, 0
+    for sep, raw in segments_sep(tokenize(stripped)):
+        raw = [expand(t, env) for t in raw]
+        assigns = prefix_env(raw)
         seg = strip_prefix(raw)
         if not seg:
+            remember(env, assigns)
             continue
         prog, args = os.path.basename(seg[0]), seg[1:]
-
         plain, inline = without_heredocs(seg, bodies)
-        for touched in modified_paths(prog, plain[1:]):
+        pargs = plain[1:]  # arguments without here-document tokens
+
+        if prog == "export":
+            remember(env, {m.group(1): m.group(2) for m in map(ASSIGN.match, args) if m})
+        for touched in modified_paths(prog, pargs):
             verdict.written[(host, shell_path(touched, cwd))] = None
         for target in redirect_targets(seg):
             verdict.written[(host, shell_path(target, cwd))] = inline
@@ -372,30 +537,43 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
         if prog == "ssh":
             name, target, remote = ssh_remote(seg, bodies)
             if name and remote and re.search(SSH_HOSTS, name):
-                check(remote, True, verdict, depth + 1, target)
+                check(remote, True, verdict, depth + 1, target, env=dict(env))
+                accounted += count_submits(" ".join(pargs))
             continue
         cflag = next(
             (i for i, a in enumerate(args) if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a)), None
         )  # -c, and combined forms such as -lc / -ic
         if prog in SHELLS and cflag is not None:
-            idx = cflag
-            if idx + 1 < len(args):
-                check(args[idx + 1], login, verdict, depth + 1, host, cwd)
+            if cflag + 1 < len(args):
+                check(args[cflag + 1], login, verdict, depth + 1, host, cwd, dict(env))
+                accounted += count_submits(args[cflag + 1])
             continue
-        if prog in SHELLS and inline is not None and not [a for a in plain[1:] if not a.startswith("-")]:
-            check(inline, login, verdict, depth + 1, host, cwd)  # `bash -s <<EOF`
+        if prog in SHELLS and inline is not None and not [a for a in pargs if not a.startswith("-")]:
+            check(inline, login, verdict, depth + 1, host, cwd, dict(env))  # `bash -s <<EOF`
             continue
         if prog == "xargs":
             rest = [a for a in args if not a.startswith("-")]
             if rest:
-                check(" ".join(shlex.quote(a) for a in rest), login, verdict, depth + 1, host, cwd)
+                check(" ".join(shlex.quote(a) for a in rest), login, verdict, depth + 1, host, cwd, dict(env))
+                accounted += count_submits(" ".join(rest))
             continue
+        if prog in HARMLESS_MENTION:
+            accounted += count_submits(" ".join(seg))
 
-        if prog == "watch" and any(os.path.basename(a) in QUERY for a in args):
+        joined = " ".join(args)
+        if (prog == "watch" and re.search(r"(?<![\w-])(%s)(?![\w-])" % _QW, joined)) or (
+            prog == "squeue" and any(re.match(r"^(-i\d*|--iterate(=.*)?)$", a) for a in args)
+        ):
             verdict.set_deny(
-                "`watch` on a scheduler command hammers the scheduler. Check once, or use "
-                "`sbatch --wait` / `condor_wait <log>`."
+                "`%s` polls the scheduler continuously. Check once, or use `sbatch --wait` / "
+                "`condor_wait <log>`." % prog
             )
+        inner = nested_commands(prog, args)
+        if inner:
+            for sub in inner:
+                check(sub, login, verdict, depth + 1, host, cwd, dict(env))
+            accounted += count_submits(joined)
+            continue
 
         walker = (
             prog in ("find", "du", "tree", "ncdu", "fd", "rg", "ag", "locate")
@@ -404,13 +582,27 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
             or (prog in ("chmod", "chown", "chgrp") and has_flag(args, "R", ("--recursive",)))
             or (prog == "lfs" and args[:1] == ["find"])
         )
-        if walker:
+        bulk = prog in ("tar", "rsync") or (prog == "cp" and has_flag(args, "rRa", ("--recursive", "--archive")))
+        if prog in QUERY or prog == "scontrol":
+            queries += 1
+        if prog in SHELLS or "/" in seg[0]:
+            verdict.scripts += [(host, shell_path(a, cwd)) for a in ([seg[0]] if "/" in seg[0] else pargs[:1])
+                                if a and not a.startswith("-")]
+        if walker or bulk:
             hit = next((a for a in args if SHARED_ROOT.match(a)), None)
+            if not hit and cwd and SHARED_ROOT.match(cwd) and not any(a.startswith(("/", "~", "$")) for a in args):
+                hit = cwd  # `cd /lustre/scratch/data && find .`
             if hit:
                 verdict.set_deny(
                     "Recursive walk of the shared path %s. Search only inside your own project or "
                     "workspace directory, with -maxdepth; for usage use `lfs quota` (Lustre) or "
-                    "`getfattr -n ceph.dir.rentries` (CephFS)." % hit
+                    "`ls -ld` / `bquota` in a job (CephFS)." % hit
+                )
+            elif any(BUDDY_ROOT.match(a) for a in args):
+                verdict.set_ask(
+                    "This walks your whole BUDDY directory on CephFS. For its size use `ls -ld "
+                    "\"$BUDDY\"`, for the file count `bquota` inside a job; search one "
+                    "subdirectory instead, or confirm with the user."
                 )
 
         if prog == "rm" and has_flag(args, "rR", ("--recursive",)):
@@ -443,7 +635,18 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
                     "how many GPUs you hold and the new request, and get their approval."
                 )
             if prog in SUBMIT:
-                verdict.submits.append((prog, args, host, cwd))
+                accounted += count_submits(" ".join(seg))
+                if any(a in NOT_A_SUBMISSION.get(prog, ()) for a in pargs):
+                    continue  # dry run or help: nothing is submitted
+                why = None
+                if any(re.search(r"[$`*?]|\[", a) for a in pargs):
+                    why = "it uses a shell variable, command substitution or wildcard the hook cannot resolve"
+                elif prog == "sbatch" and any(k.startswith("SBATCH_") for k in list(env) + list(assigns)):
+                    why = "SBATCH_* environment variables override the job script and are not read by the hook"
+                if verdict.blind:
+                    verdict.set_ask(BLIND_WRITER % verdict.blind)
+                verdict.submits.append(dict(prog=prog, args=pargs, host=host, cwd=cwd, stdin=inline,
+                                            piped=(sep == "|"), why=why))
             if prog in ("scancel", "condor_rm") and agent_jobs_only(prog, args, host):
                 continue  # removing the agent's own tagged jobs needs no approval
             if CONFIRM_JOBS and prog not in AUTO_SUBMIT:
@@ -453,10 +656,18 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
                 )
             continue  # whatever follows runs inside the allocation
 
+        if not (prog in SHELLS and (cflag is not None or inline is not None)):
+            verdict.blind = verdict.blind or blind_writer(prog, pargs)
+
         if not login:
             continue
 
-        if prog in COMPUTE or (prog == "accelerate" and args[:1] == ["launch"]):
+        sub = args[0] if args else ""
+        if (
+            (prog in COMPUTE and sub not in ("--version", "--help", "-h", "-V"))
+            or sub in COMPUTE_SUB.get(prog, ())
+            or re.match(r"^mpi(run|exec)\b", prog)
+        ):
             verdict.set_deny(
                 "`%s` would run on a login node. Put it in a batch job, or use the debug queue / "
                 "an interactive job (`srun --pty`, `condor_submit -interactive`)." % prog
@@ -476,6 +687,15 @@ def check(cmd, login, verdict, depth=0, host=None, cwd=None):
             jobs = [int(m.group(1)) for a in args for m in [re.match(r"^-j(\d+)$", a)] if m]
             if any(a == "-j" for a in args) or any(j > 8 for j in jobs):
                 verdict.set_ask("Large parallel build on a login node. Use -j8 or less, or build in a job.")
+
+    sleeps = [int(x) for x in re.findall(r"\bsleep\s+(\d+)", stripped)]
+    if queries >= 3 and sleeps and min(sleeps) < MIN_POLL:
+        verdict.set_deny(
+            "Several scheduler queries with short sleeps in one command are polling. Use `sbatch "
+            "--wait` / `condor_wait <log>`, or check once and wait at least %d s." % MIN_POLL
+        )
+    if total > accounted:
+        verdict.set_ask(UNREAD_SUBMIT)
 
 
 def rate_limit(count, verdict):
@@ -602,29 +822,194 @@ def same_command_file(path, host, cwd, written):
     """False: not written by this command. None: written, content unknown. Else the content."""
     if not path:
         return False
-    return (written or {}).get((host, shell_path(path, cwd)), False)
+    written = written or {}
+    keys = [(host, shell_path(path, cwd))]
+    joined = path if not cwd or path.startswith(("/", "~", "$")) else cwd.rstrip("/") + "/" + path
+    if not joined.startswith(("/", "~", "$")):
+        keys.append((host, shell_path("~/" + joined, None)))  # an ssh session starts in the home directory
+    for key in keys:
+        if key in written:
+            return written[key]
+    return False
 
 
-def slurm_limits(args, host, cwd, verdict, written=None):
-    path = job_file(args)
-    inline = same_command_file(path, host, cwd, written)
-    if inline is None:
-        verdict.set_ask(WRITTEN_HERE % path)
+UNKNOWN_REQUEST = (
+    "The hook cannot work out what this submission requests (%s); you currently hold %d GPU(s). "
+    "Write the request with literal numbers in the job file or on the command line and submit "
+    "it as a plain command, or get the user's approval."
+)
+
+SB_LONG = set("""account acctg-freq array batch bb bbf begin chdir cluster-constraint clusters comment
+constraint container container-id contiguous core-spec cores-per-socket cpu-freq cpus-per-gpu
+cpus-per-task deadline delay-boot dependency distribution error exclude exclusive export export-file
+extra extra-node-info get-user-env gid gpu-bind gpu-freq gpus gpus-per-node gpus-per-socket
+gpus-per-task gres gres-flags help hint hold ignore-pbs input job-name kill-on-invalid-dep licenses
+mail-type mail-user mcs-label mem mem-bind mem-per-cpu mem-per-gpu mincpus network nice no-kill
+no-requeue nodefile nodelist nodes ntasks ntasks-per-core ntasks-per-gpu ntasks-per-node
+ntasks-per-socket open-mode output overcommit oversubscribe parsable partition prefer priority profile
+propagate qos quiet reboot requeue reservation resv-ports segment signal sockets-per-node spread-job
+switches test-only thread-spec threads-per-core time time-min tmp tres-bind tres-per-task tres-per-job
+tres-per-node tres-per-socket uid usage use-min-nodes verbose version wait wait-all-nodes wckey
+wrap""".split())
+SB_BOOL_LONG = set("""contiguous exclusive get-user-env help hold ignore-pbs kill-on-invalid-dep nice
+no-kill no-requeue overcommit oversubscribe parsable quiet reboot requeue spread-job test-only usage
+use-min-nodes verbose version wait""".split())
+SB_BOOL_SHORT = set("hHOQsvVWk")
+SB_SHORT = {"G": "gpus", "N": "nodes", "n": "ntasks", "p": "partition", "J": "job-name", "a": "array",
+            "w": "nodelist", "F": "nodefile", "D": "chdir"}
+
+
+def parse_sbatch(tokens):
+    """sbatch arguments (or the words of #SBATCH lines) -> (options, script, problems).
+
+    Everything after the script name belongs to the script. Options the hook does not
+    know, including abbreviated long options, are reported as problems."""
+    opts, script, bad, i = {}, None, [], 0
+    while i < len(tokens):
+        a = tokens[i]
+        if a == "<":
+            script = tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 2
+            continue
+        if re.match(r"^\d*[<>&]", a):  # another redirection
+            i += 2 if a.endswith(">") else 1
+            continue
+        if re.match(r"^\d+$", a) and i + 1 < len(tokens) and tokens[i + 1].startswith(">"):
+            i += 1
+            continue
+        if a == ":":
+            bad.append("a heterogeneous job")
+        elif a == "--":
+            script = tokens[i + 1] if i + 1 < len(tokens) else None
+            break
+        elif a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name not in SB_LONG:
+                bad.append("the option --%s, which is abbreviated or unknown to the hook" % name)
+            if not eq and name not in SB_BOOL_LONG:
+                i += 1
+                val = tokens[i] if i < len(tokens) else ""
+            opts[name] = val
+        elif a.startswith("-") and len(a) > 1:
+            if a[1] not in SB_BOOL_SHORT:
+                val = a[2:]
+                if not val:
+                    i += 1
+                    val = tokens[i] if i < len(tokens) else ""
+                opts[SB_SHORT.get(a[1], a[1])] = val
+        else:
+            script = a
+            break
+        i += 1
+    return opts, script, bad
+
+
+def sbatch_directives(text):
+    """Words of the #SBATCH lines that Slurm reads: those before the first command."""
+    words = []
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("#SBATCH"):
+            body = st[len("#SBATCH"):]
+            try:
+                words += shlex.split(body, comments=True)
+            except ValueError:
+                words += body.split()
+        elif st and not st.startswith("#"):
+            break
+    return words
+
+
+def entries_sum(value):
+    """'2', 'a40:2', 'a40:2,a100:3' -> total, or None if an entry cannot be read."""
+    total = 0
+    for entry in value.split(","):
+        n = gpu_count(entry)
+        if n is None:
+            return None
+        total += n
+    return total
+
+
+def slurm_request(opts):
+    """Total GPUs one job (or one array task) asks for -> (gpus, problems)."""
+    bad = []
+    for k in opts:
+        if k.startswith("tres-per-") or k in ("gpus-per-socket", "ntasks-per-gpu"):
+            bad.append("the option --%s" % k)
+    try:
+        nodes = max(int(x) for x in opts.get("nodes", "1").split("-"))
+    except ValueError:
+        nodes, _ = 1, bad.append("the node count %r" % opts.get("nodes"))
+    try:
+        if "ntasks" in opts:
+            tasks = int(opts["ntasks"])
+        elif "ntasks-per-node" in opts:
+            tasks = int(opts["ntasks-per-node"]) * nodes
+        else:
+            tasks = 1
+    except ValueError:
+        tasks, _ = 1, bad.append("the task count")
+    counts = []
+    if "gpus" in opts:
+        counts.append(entries_sum(opts["gpus"]))
+    if "gpus-per-node" in opts:
+        n = entries_sum(opts["gpus-per-node"])
+        counts.append(None if n is None else n * nodes)
+    if "gpus-per-task" in opts:
+        n = entries_sum(opts["gpus-per-task"])
+        counts.append(None if n is None else n * tasks)
+    gres = [e for e in opts.get("gres", "").split(",") if e.split(":")[0] == "gpu"]
+    if gres:
+        per_node = 0
+        for e in gres:
+            n = 1 if e == "gpu" else gpu_count(e)
+            per_node = None if n is None or per_node is None else per_node + n
+        counts.append(None if per_node is None else per_node * nodes)
+    if (gres or "gpus-per-node" in opts) and ("nodelist" in opts or "nodefile" in opts):
+        bad.append("a node list together with a per-node GPU request")
+    if None in counts:
+        bad.append("the GPU count")
+    elif len(counts) > 1:
+        bad.append("several different GPU options at once (use one of --gpus, --gres, --gpus-per-node, --gpus-per-task)")
+    return (max(counts) if counts and None not in counts else 0), bad
+
+
+def slurm_limits(sub, verdict, written, totals):
+    """totals: GPUs and jobs requested by earlier submits in the same command."""
+    args, host, cwd = sub["args"], sub["host"], sub["cwd"]
+    copts, path, bad = parse_sbatch(args)
+    if sub["why"]:
+        bad.append(sub["why"])
+    text, readable = None, True
+    if path:
+        inline = same_command_file(path, host, cwd, written)
+        if inline is None:
+            verdict.set_ask(WRITTEN_HERE % path)
+        elif inline is not False:
+            text = inline
+    elif sub["stdin"] is not None:
+        text = sub["stdin"]  # sbatch <<EOF ... EOF
+    elif "wrap" not in copts:
+        bad.append("the job script arrives on standard input")
     script = (
         "command -v squeue >/dev/null && squeue --me -h -r -t PD,R,S,CF,RQ,RS "
         "-O Partition:60,tres-alloc:300 && echo @@ok"
     )
-    if path and inline is False:
-        script += "; test -r {0} && echo @@readable; grep -E '^#SBATCH' {0} 2>/dev/null".format(shell_path(path, cwd))
+    if path and text is None:
+        script += "; test -r {0} && echo @@readable; head -n 400 {0} 2>/dev/null".format(shell_path(path, cwd))
     out = probe(host, script)
-    queue_text, _, directives = (out or "").partition("@@ok")
-    if inline:
-        directives = "@@readable\n" + "\n".join(l for l in inline.splitlines() if l.startswith("#SBATCH"))
-    readable = "@@readable" in directives
-    directives = "\n".join(l.strip()[len("#SBATCH"):] for l in directives.splitlines() if l.strip().startswith("#SBATCH"))
-    texts = (" ".join(args), directives)  # command line overrides the script
+    queue_text, _, remote_text = (out or "").partition("@@ok")
+    if path and text is None:
+        readable = "@@readable" in remote_text
+        text = remote_text.replace("@@readable", "", 1)
+    dopts, stray, dbad = parse_sbatch(sbatch_directives(text or ""))
+    if stray:
+        dbad.append("a heterogeneous job or stray word (%s) in the #SBATCH lines" % stray)
+    opts = dict(dopts, **copts)  # the command line overrides the script
+    bad += dbad
 
-    spec = sbatch_option(texts, ["array"], ["a"])
+    spec = opts.get("array")
     tasks, capped = array_tasks(spec) if spec else (1, True)
     if tasks is None or (tasks > MAX_UNCAPPED and not capped):
         verdict.set_ask(
@@ -634,10 +1019,9 @@ def slurm_limits(args, host, cwd, verdict, written=None):
     cap = re.search(r"%(\d+)", spec or "")
     concurrent = min(tasks or 10 ** 6, int(cap.group(1))) if cap else (tasks or 1)
 
-    partition = sbatch_option(texts, ["partition"], ["p"]) or ""
+    partition = opts.get("partition", "")
     if re.search(SLURM_LONG_PARTITIONS, partition):
-        name = sbatch_option(texts, ["job-name"], ["J"]) or (os.path.basename(path) if path else "wrap")
-        name = name.strip("'\"")
+        name = opts.get("job-name") or (os.path.basename(path) if path else ("wrap" if "wrap" in opts else "sbatch"))
         hist = probe(
             host,
             "sacct -X -n -P -S now-%ddays -E now -s CD -o JobName,Partition 2>/dev/null; echo @@ok" % TEST_RUN_DAYS,
@@ -654,68 +1038,48 @@ def slurm_limits(args, host, cwd, verdict, written=None):
                 "approval." % (partition, name, TEST_RUN_DAYS)
             )
 
-    nodes = gpu_count((sbatch_option(texts, ["nodes"], ["N"]) or "1").split("-")[0]) or 1
-    ntasks = gpu_count(sbatch_option(texts, ["ntasks"], ["n"]) or "1") or 1
-    per_job = sbatch_option(texts, ["gpus"], ["G"])
-    per_node = sbatch_option(texts, ["gpus-per-node"])
-    per_task = sbatch_option(texts, ["gpus-per-task"])
-    gres = sbatch_option(texts, ["gres"])
-    gres_gpu = re.search(r"(?:^|,)(gpu(?::[^,]*)?)", gres or "")
-    if per_job:
-        new_gpus = gpu_count(per_job)
-    elif per_node:
-        new_gpus = (gpu_count(per_node) or 0) * nodes if gpu_count(per_node) is not None else None
-    elif per_task:
-        new_gpus = (gpu_count(per_task) or 0) * ntasks if gpu_count(per_task) is not None else None
-    elif gres_gpu:
-        n = gpu_count(gres_gpu.group(1)) if ":" in gres_gpu.group(1) else 1
-        new_gpus = n * nodes if n is not None else None
-    elif path and out is not None and not readable:
-        new_gpus = None  # job script not readable from here
-    else:
-        new_gpus = 0
+    new_gpus, rbad = slurm_request(opts)
+    bad += rbad
+    if path and out is not None and not readable:
+        bad.append("the job script %s cannot be read" % path)
 
     if out is None:
         verdict.set_ask("Could not check how many jobs and GPUs you already have. Confirm this submission with the user.")
         return
     lines = [l for l in queue_text.splitlines() if l.strip()]
-    queued = len(lines)
-    held_gpus = sum(int(n) for l in lines for n in re.findall(r"gres/gpu=(\d+)", l))
+    queued = len(lines) + totals["jobs"]
+    held_gpus = 0
+    for l in lines:
+        plain_n = re.findall(r"gres/gpu=(\d+)", l)
+        held_gpus += sum(int(n) for n in (plain_n or re.findall(r"gres/gpu:[\w.-]+=(\d+)", l)))
     if queued + (tasks or 1) > MAX_QUEUED:
         verdict.set_ask(
             "You have %d jobs queued and this adds %s (limit %d without asking). Confirm with the user."
             % (queued, tasks or "an unknown number", MAX_QUEUED)
         )
-    if new_gpus is None:
+    if bad:
+        verdict.set_ask(UNKNOWN_REQUEST % ("; ".join(dict.fromkeys(bad)), held_gpus))
+    elif new_gpus > 0 and held_gpus + totals["gpus"] + new_gpus * concurrent > SLURM_GPU_BUDGET:
         verdict.set_ask(
-            "Could not work out how many GPUs this job requests; you currently hold %d. Confirm "
-            "this submission with the user." % held_gpus
-        )
-    elif new_gpus > 0 and held_gpus + new_gpus * concurrent > SLURM_GPU_BUDGET:
-        verdict.set_ask(
-            "GPU budget: you hold %d GPU(s) in running or pending jobs and this requests %d more "
+            "GPU budget: you hold %d GPU(s) in running or pending jobs and this command requests %d more "
             "(budget %d without asking). Tell the user both numbers and get their approval."
-            % (held_gpus, new_gpus * concurrent, SLURM_GPU_BUDGET)
+            % (held_gpus, totals["gpus"] + new_gpus * concurrent, SLURM_GPU_BUDGET)
         )
+    totals["gpus"] += new_gpus * concurrent
+    totals["jobs"] += tasks or 1
 
 
-def condor_test_gate(text, args, host, gpus, verdict):
+def condor_test_gate(hours, name, host, gpus, verdict):
     """Jobs above CONDOR_LONG_HOURS need a short test run of the same JobBatchName that
     completed with exit code 0. Short runs are noted locally at submission, so the history
     scan on the submit host only reaches back to that moment."""
-    hours = re.findall(r"(?im)^\s*\+?MaxRuntimeHours\s*=\s*(\d+)", text)
-    if not hours:
+    if hours is None:
         return
-    hours = int(hours[-1])
-    names = re.findall(r'(?im)^\s*(?:\+?JobBatchName|batch_name)\s*=\s*"?([^"\n]+?)"?\s*$', text)
-    name = names[-1] if names else None
-    for i, a in enumerate(args[:-1]):
-        if a == "-batch-name":
-            name = args[i + 1]
     path = os.path.join(STATE_DIR, "condor_tests.log")
     now = int(time.time())
     if hours <= CONDOR_TEST_HOURS:
         if name:
+            NOTED_NOW.add(name)
             try:
                 os.makedirs(STATE_DIR, exist_ok=True)
                 with open(path, "a") as fh:
@@ -730,6 +1094,12 @@ def condor_test_gate(text, args, host, gpus, verdict):
             "This job may run for %d hours. Jobs above %d hours need a JobBatchName (letters, "
             "digits, . _ -) shared with a short test run that completed first; set one, or get "
             "the user's approval." % (hours, CONDOR_LONG_HOURS)
+        )
+        return
+    if name in NOTED_NOW:
+        verdict.set_ask(
+            "The test run `%s` is submitted by this same command, so it cannot have completed. "
+            "Wait for it, check its output, then submit the %d-hour job." % (name, hours)
         )
         return
     since = None
@@ -759,21 +1129,154 @@ def condor_test_gate(text, args, host, gpus, verdict):
         )
 
 
-CONDOR_KEYS = r"^[[:space:]]*(request_gpus|queue|max_materialize|[+]?MaxRuntimeHours|[+]?JobBatchName|batch_name)"
+NOTED_NOW = set()  # test runs noted during this invocation
+CONDOR_KEYS = (
+    r"^[[:space:]]*([+]|my[.])?[[:space:]]*"
+    r"(request_gpus|requestgpus|queue|max_materialize|maxruntimehours|jobbatchname|batch_name|include|hold)"
+)
+CS_VALUE = {"-a", "-append", "-batch-name", "-name", "-remote", "-pool", "-maxjobs", "-addr", "-dump", "-digest"}
 
 
-def condor_limits(args, host, cwd, verdict, written=None):
-    path = job_file(args)
-    inline = same_command_file(path, host, cwd, written)
-    if inline is None:
-        verdict.set_ask(WRITTEN_HERE % path)
+def parse_condor_args(tokens):
+    """-> (submit file or None, appended commands, batch name, problems)."""
+    path, appends, name, bad, i = None, [], None, [], 0
+    while i < len(tokens):
+        a = tokens[i]
+        if a == "<":
+            path = tokens[i + 1] if i + 1 < len(tokens) else None
+            i += 2
+            continue
+        if re.match(r"^\d*[<>&]", a):
+            i += 2 if a.endswith(">") else 1
+            continue
+        if a in ("-queue", "-q"):
+            bad.append("a `-queue` on the command line")
+            break
+        if a in CS_VALUE:
+            val = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if a in ("-a", "-append"):
+                appends.append(val)
+            elif a == "-batch-name":
+                name = val
+            i += 2
+            continue
+        if not a.startswith("-") and path is None:
+            path = a
+        i += 1
+    return path, appends, name, bad
+
+
+def condor_request(file_text, appends):
+    """Read the lines of a submit description that matter.
+
+    -> dict(gpus, jobs, uncapped, hours, name, bad). gpus/jobs are totals over all
+    queue statements; jobs is None for a list the hook cannot count."""
+    bad, cur, cap, hours, name = [], {"gpus": 0}, [None], [None], [None]
+    forced = {}
+
+    def setting(key, val, into):
+        key, val = key.lower(), val.strip()
+        if key in ("request_gpus", "requestgpus"):
+            into["gpus"] = int(val) if val.isdigit() else None
+        elif key == "max_materialize":
+            into["cap"] = int(val) if val.isdigit() else None
+            if not val.isdigit():
+                bad.append("max_materialize = %s" % val)
+        elif key == "maxruntimehours":
+            if val.isdigit():
+                into["hours"] = int(val)
+            else:
+                into["hours"] = None
+                bad.append("MaxRuntimeHours = %s" % val)
+        elif key in ("jobbatchname", "batch_name"):
+            into["name"] = val.strip("\"'")
+        elif key == "hold" and val.lower().startswith("t"):
+            bad.append("the job is submitted on hold, which the group's rules do not allow")
+
+    def split(line):
+        m = re.match(r"(?i)^\s*(?:\+|my\.)?\s*([A-Za-z_]\w*)\s*=\s*(.*)$", line)
+        return (m.group(1), m.group(2)) if m else None
+
+    queue_lines = []
+    for a in appends:
+        if re.match(r"(?i)^\s*queue\b", a):
+            queue_lines.append(a)
+        elif split(a):
+            setting(*split(a), into=forced)  # -append applies to every queue statement
+    state, total_gpus, total_jobs, uncapped, seen = {"gpus": 0}, 0, 0, False, 0
+    for line in file_text.splitlines() + queue_lines:
+        if re.match(r"(?i)^\s*include\b", line):
+            bad.append("an `include` line")
+            continue
+        q = re.match(r"(?i)^\s*queue\b(.*)$", line)
+        if not q:
+            if split(line):
+                setting(*split(line), into=state)
+            continue
+        seen += 1
+        eff = dict(state, **forced)
+        rest = q.group(1).strip()
+        m = re.match(r"^(\d+)?\s*[\w,\s]*?\bin\s*\(?([^()$]*)\)?\s*$", rest)
+        if not rest:
+            n = 1
+        elif rest.isdigit():
+            n = int(rest)
+        elif m and "$" not in rest and not re.search(r"\b(from|matching)\b", rest):
+            items = [x for x in re.split(r"[,\s]+", m.group(2).strip()) if x]
+            n = (int(m.group(1)) if m.group(1) else 1) * len(items) if items else None
+        else:
+            n = None
+        g, c = eff.get("gpus", 0), eff.get("cap")
+        if n is None:
+            total_jobs = None
+            if c is None:
+                uncapped = True
+            if g is None or (g and c is None):
+                total_gpus = None
+            elif total_gpus is not None:
+                total_gpus += g * (c or 0)
+            continue
+        if n > MAX_UNCAPPED and c is None:
+            uncapped = True
+        if total_jobs is not None:
+            total_jobs += n
+        if g is None:
+            total_gpus = None
+        elif total_gpus is not None:
+            total_gpus += g * (min(n, c) if c else n)
+    final = dict(state, **forced)
+    if total_jobs is not None and total_jobs > MAX_UNCAPPED and final.get("cap") is None:
+        uncapped = True
+    if not seen:  # no queue statement: one job with the final settings
+        total_jobs = 1
+        total_gpus = final.get("gpus", 0)
+    return dict(gpus=total_gpus, jobs=total_jobs, uncapped=uncapped, hours=final.get("hours"),
+                name=final.get("name"), bad=bad)
+
+
+def condor_limits(sub, verdict, written, totals):
+    args, host, cwd = sub["args"], sub["host"], sub["cwd"]
+    path, appends, batch, bad = parse_condor_args(args)
+    if path == "-":
+        path = None
+    if sub["why"]:
+        bad.append(sub["why"])
+    interactive = any(a in ("-interactive", "-i") for a in args)
+    text = None
+    if path:
+        inline = same_command_file(path, host, cwd, written)
+        if inline is None:
+            verdict.set_ask(WRITTEN_HERE % path)
+        elif inline is not False:
+            text = inline
+    elif sub["stdin"] is not None:
+        text = sub["stdin"]  # condor_submit <<EOF ... EOF
+    elif not interactive:
+        bad.append("the submit description arrives on standard input")
     script = 'command -v condor_q >/dev/null || exit 1; condor_q -global "$USER" -af JobStatus RequestGPUs 2>/dev/null; echo @@ok'
-    if path and inline is False:
-        script += "; grep -iE '%s' %s 2>/dev/null" % (CONDOR_KEYS, shell_path(path, cwd))
+    if path and text is None:
+        script += "; test -r {1} && echo @@readable; grep -iE '{0}' {1} 2>/dev/null".format(CONDOR_KEYS, shell_path(path, cwd))
     out = probe(host, script)
-    if out is not None and inline:
-        keys = re.compile(CONDOR_KEYS.replace("[[:space:]]", r"\s"), re.I)
-        out = out.partition("@@ok")[0] + "@@ok\n" + "\n".join(l for l in inline.splitlines() if keys.match(l))
     if out is None:
         verdict.set_ask(
             "Could not check how many GPUs and jobs you currently hold. Run "
@@ -781,53 +1284,41 @@ def condor_limits(args, host, cwd, verdict, written=None):
             "submission with the user."
         )
         return
-    queue_text, _, file_text = out.partition("@@ok")
+    queue_text, _, remote_text = out.partition("@@ok")
+    if path and text is None:
+        if "@@readable" not in remote_text:
+            bad.append("the submit file %s cannot be read" % path)
+        text = remote_text.replace("@@readable", "", 1)
     active = [g for st, g in re.findall(r"(?m)^\s*(\d)\s+(\S+)\s*$", queue_text) if st in "125"]
-    held_gpus = sum(int(g) for g in active if g.isdigit())
+    held_gpus = sum(int(float(g)) for g in active if re.match(r"^\d+(\.\d+)?$", g))
 
-    text = file_text + "\n" + "\n".join(args)  # -append values come last and win
-    gpus = re.findall(r"(?im)^\s*request_gpus\s*=\s*(\S*)", text)
-    if gpus and gpus[-1].isdigit():
-        new_gpus = int(gpus[-1])
-    elif gpus:
-        new_gpus = None  # a macro or variable, e.g. request_gpus = $(N)
-    elif path and not file_text.strip():
-        new_gpus = None  # submit file not readable from here
-    else:
-        new_gpus = 0
+    req = condor_request(text or "", appends)
+    bad += req["bad"]
+    if req["gpus"] is None:
+        bad.append("the GPU count")
+    name = batch or req["name"]
+    condor_test_gate(req["hours"], name, host, req["gpus"] or 0, verdict)
 
-    condor_test_gate(text, args, host, new_gpus or 0, verdict)
-
-    cap = re.search(r"(?im)^\s*max_materialize\s*=\s*(\d+)", text)
-    queue = re.search(r"(?im)^\s*queue\b[ \t]*(\d+)?(.*)$", text)
-    if queue and queue.group(1):
-        procs = int(queue.group(1))
-    elif queue and re.search(r"\b(from|in|matching)\b", queue.group(2)):
-        procs = None
-    else:
-        procs = 1
-    if (procs is None or procs > MAX_UNCAPPED) and not cap:
+    if req["uncapped"]:
         verdict.set_ask(
             "This submit file queues %s jobs without `max_materialize`. Add a cap or confirm with the user."
-            % (procs or "a list of")
+            % (req["jobs"] or "a list of")
         )
-    concurrent = min(procs or 10 ** 6, int(cap.group(1))) if cap else (procs or 1)
-    if len(active) + (procs or concurrent) > MAX_QUEUED:
+    if len(active) + totals["jobs"] + (req["jobs"] or 0) > MAX_QUEUED:
         verdict.set_ask(
             "You have %d jobs queued and this adds %s (limit %d without asking). Confirm with the user."
-            % (len(active), procs or "a list", MAX_QUEUED)
+            % (len(active) + totals["jobs"], req["jobs"] or "a list", MAX_QUEUED)
         )
-    if new_gpus is None:
+    if bad:
+        verdict.set_ask(UNKNOWN_REQUEST % ("; ".join(dict.fromkeys(bad)), held_gpus))
+    elif req["gpus"] > 0 and held_gpus + totals["gpus"] + req["gpus"] > GPU_BUDGET:
         verdict.set_ask(
-            "Could not read from the submit file how many GPUs it requests; you currently hold "
-            "%d. Confirm this submission with the user." % held_gpus
-        )
-    elif new_gpus > 0 and held_gpus + new_gpus * concurrent > GPU_BUDGET:
-        verdict.set_ask(
-            "GPU budget: you hold %d GPU(s) in running, idle or held jobs and this requests %d more "
+            "GPU budget: you hold %d GPU(s) in running, idle or held jobs and this command requests %d more "
             "(budget %d without asking). Tell the user both numbers and get their approval."
-            % (held_gpus, new_gpus * concurrent, GPU_BUDGET)
+            % (held_gpus, totals["gpus"] + req["gpus"], GPU_BUDGET)
         )
+    totals["gpus"] += req["gpus"] or 0
+    totals["jobs"] += req["jobs"] or 0
 
 
 SCP_ARG_OPTS = set("cFiJloPSX")
@@ -864,6 +1355,9 @@ def record_copy(prog, args, local_dir, local_written, verdict):
         if re.match(r"^[^/]+:", src):
             continue  # remote source
         lp = local_path(src, local_dir)
+        if os.path.isdir(lp) or src.endswith("/") or re.search(r"[*?\[]", src):
+            verdict.blind = verdict.blind or "%s (copying a directory or several files)" % prog
+            continue
         content = local_written.get(lp, False)
         if content is False:
             try:
@@ -878,6 +1372,58 @@ def record_copy(prog, args, local_dir, local_written, verdict):
             targets = [dest, dest.rstrip("/") + "/" + name]  # DEST may be a directory
         for t in targets:
             verdict.written[(host, shell_path(t, None))] = content
+
+
+def check_local(cmd, verdict, local_dir, local_written, depth=0, env=None):
+    """Off-cluster: ssh calls to a cluster, plus files copied there with scp/rsync in the
+    same command (read locally, since the copy has not happened yet when the hook runs)."""
+    env = {} if env is None else env
+    stripped, bodies = split_heredocs(cmd)
+    if re.search(r"(?<![\w-])ssh(?![\w-])", stripped):
+        loop_rules(stripped, verdict)  # loops on the workstation around an ssh call
+    total, accounted, queries = count_submits(stripped), 0, 0
+    for sep, raw in segments_sep(tokenize(stripped)):
+        raw = [expand(t, env) for t in raw]
+        assigns = prefix_env(raw)
+        seg = strip_prefix(raw)
+        if not seg:
+            remember(env, assigns)
+            continue
+        plain, inline = without_heredocs(seg, bodies)
+        prog, args = os.path.basename(seg[0]), seg[1:]
+        if prog == "export":
+            remember(env, {m.group(1): m.group(2) for m in map(ASSIGN.match, args) if m})
+        if prog not in ("scp", "rsync"):
+            for touched in modified_paths(prog, plain[1:]):
+                local_written[local_path(touched, local_dir)] = None
+        for target in redirect_targets(seg):
+            local_written[local_path(target, local_dir)] = inline
+        cflag = next((i for i, a in enumerate(args) if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a)), None)
+        if prog == "ssh":
+            name, target, remote = ssh_remote(seg, bodies)
+            if name and remote and re.search(SSH_HOSTS, name):
+                check(remote, True, verdict, 1, target, env=dict(env))
+                accounted += count_submits(" ".join(plain[1:]))
+        elif prog in ("scp", "rsync"):
+            record_copy(prog, plain[1:], local_dir, local_written, verdict)
+        elif prog in SHELLS and cflag is not None and cflag + 1 < len(args) and depth < 3:
+            check_local(args[cflag + 1], verdict, local_dir, local_written, depth + 1, dict(env))
+            accounted += count_submits(args[cflag + 1])
+        elif prog in HARMLESS_MENTION:
+            accounted += count_submits(" ".join(seg))
+        elif prog == "watch" and re.search(r"\bssh\b", " ".join(args)) and re.search(r"(?<![\w-])(%s)(?![\w-])" % _QW, " ".join(args)):
+            verdict.set_deny(
+                "`watch` around a scheduler query polls the scheduler continuously. Check once, "
+                "or use `sbatch --wait` / `condor_wait <log>`."
+            )
+    sleeps = [int(x) for x in re.findall(r"\bsleep\s+(\d+)", stripped)]
+    if queries >= 3 and sleeps and min(sleeps) < MIN_POLL:
+        verdict.set_deny(
+            "Several scheduler queries with short sleeps in one command are polling. Use `sbatch "
+            "--wait` / `condor_wait <log>`, or check once and wait at least %d s." % MIN_POLL
+        )
+    if total > accounted:
+        verdict.set_ask(UNREAD_SUBMIT)
 
 
 def main():
@@ -898,40 +1444,30 @@ def main():
     if on_cluster:
         check(cmd, not in_job, verdict)
     else:
-        # Off-cluster: ssh calls to a cluster, plus files copied there with
-        # scp/rsync in the same command (read locally, since the copy has not
-        # happened yet when the hook runs).
-        local_dir = payload.get("cwd") or os.getcwd()
-        local_written = {}
-        stripped, bodies = split_heredocs(cmd)
-        for raw in segments(tokenize(stripped)):
-            seg = strip_prefix(raw)
-            if not seg:
-                continue
-            plain, inline = without_heredocs(seg, bodies)
-            prog = os.path.basename(seg[0])
-            if prog not in ("scp", "rsync"):
-                for touched in modified_paths(prog, plain[1:]):
-                    local_written[local_path(touched, local_dir)] = None
-            for target in redirect_targets(seg):
-                local_written[local_path(target, local_dir)] = inline
-            if prog == "ssh":
-                name, target, remote = ssh_remote(seg, bodies)
-                if name and remote and re.search(SSH_HOSTS, name):
-                    check(remote, True, verdict, 1, target)
-            elif prog in ("scp", "rsync"):
-                record_copy(prog, plain[1:], local_dir, local_written, verdict)
+        check_local(cmd, verdict, payload.get("cwd") or os.getcwd(), {})
 
     if verdict.submits and not verdict.deny:
-        limits = Verdict()
+        limits, totals = Verdict(), {}
         rate_limit(len(verdict.submits), limits)
-        for prog, args, host, cwd in verdict.submits:
-            if prog == "sbatch":
-                slurm_limits(args, host, cwd, limits, verdict.written)
-            elif prog == "condor_submit":
-                condor_limits(args, host, cwd, limits, verdict.written)
+        for sub in verdict.submits:
+            t = totals.setdefault(sub["prog"], {"gpus": 0, "jobs": 0})
+            if sub["prog"] == "sbatch":
+                slurm_limits(sub, limits, verdict.written, t)
+            elif sub["prog"] == "condor_submit":
+                condor_limits(sub, limits, verdict.written, t)
         if limits.ask:
             verdict.ask = limits.ask  # more specific than the generic confirmation
+
+    if verdict.scripts and not verdict.deny and not verdict.ask:
+        for h in dict.fromkeys(h for h, _ in verdict.scripts):
+            files = " ".join(dict.fromkeys(f for hh, f in verdict.scripts if hh == h))
+            found = probe(h, "grep -lE '(^|[^[:alnum:]_.-])(sbatch|condor_submit)([^[:alnum:]_.-]|$)' %s 2>/dev/null; echo @@ok" % files)
+            if found and found.partition("@@ok")[0].strip():
+                verdict.set_ask(
+                    "The script %s submits jobs itself, so the hook cannot check those submissions. "
+                    "Run each submit as a plain command instead, or get the user's approval."
+                    % found.partition("@@ok")[0].split()[0]
+                )
 
     if verdict.deny:
         respond("deny", verdict.deny)

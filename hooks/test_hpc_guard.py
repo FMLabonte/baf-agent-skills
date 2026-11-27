@@ -92,6 +92,7 @@ CASES = [
 # commands stand in for the cluster: held = "JobStatus RequestGPUs" rows.
 QUIET = dict(LOGIN, HPC_GUARD_CONFIRM_JOBS="0")
 CONFIRM = dict(LOGIN)
+G = lambda n: SBATCH % ("#SBATCH -p mlgpu_devel\n#SBATCH --gpus=%d" % n)
 REMOTE = dict(LOCAL, HPC_GUARD_CONFIRM_JOBS="0")
 JDL = "executable = run.sh\nrequest_gpus = %d\n%squeue %s\n"
 SBATCH = "#!/bin/bash\n#SBATCH --time=1:00:00\n%s\nsrun true\n"
@@ -196,6 +197,112 @@ LIMIT_CASES = [
     (dict(CONFIRM, FAKE_HISTORY="train|mlgpu_devel\n"), "", 0, SBATCH % "#SBATCH -p mlgpu_long\n#SBATCH -J train\n#SBATCH --gpus=5", "sbatch {f}", "ask"),
     (CONFIRM, "", 0, None, "sbatch /nonexistent/job.sh", "ask"),
     (CONFIRM, "", 0, SBATCH % "#SBATCH -p sgpu_short\n#SBATCH --gres=gpu:a100:4", "sbatch {f}", None),
+    # ---- fail-closed rework after the 2026-11-27 stress test (tools/stress/FINDINGS.md) ----
+    # H1: several submits in one command are summed
+    (REMOTE, "", 0, G(2), "ssh marvin 'cd {d} && sbatch {b} && sbatch {b}'", None),
+    (REMOTE, "", 0, G(3), "ssh marvin 'cd {d} && sbatch {b} && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(3), "ssh marvin 'cd {d} && sbatch {b}'; ssh marvin 'cd {d} && sbatch {b}'", "ask"),
+    (REMOTE, "2 1\n", 0, JDL % (1, "", "1"), "ssh baf 'cd {d} && condor_submit {b} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, JDL % (1, "", "1"), "ssh baf 'cd {d} && condor_submit {b} && condor_submit {b}'", None),
+    # H2: a submit after a shell keyword is read; one the hook cannot read asks
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && if [ -f {b} ]; then sbatch {b}; fi'", None),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && if [ -f {b} ]; then sbatch {b}; fi'", "ask"),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && { sbatch {b}; }'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && J=`sbatch --parsable {b}`'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && echo \"id $(sbatch --parsable {b})\"'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && sub() { sbatch \"$1\"; }; sub {b}'", "ask"),
+    (REMOTE, "", 0, G(5), "if ssh marvin 'cd {d} && sbatch {b}'; then echo ok; fi", "ask"),
+    (REMOTE, "", 0, G(1), "JID=`ssh marvin 'cd {d} && sbatch --parsable {b}'`", "ask"),
+    (REMOTE, "", 0, G(5), "bash -c \"ssh marvin 'cd {d} && sbatch {b}'\"", "ask"),
+    (REMOTE, "", 0, G(1), "for s in 1 2 3; do ssh marvin 'cd {d} && sbatch {b}'; done", "deny"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && find . -maxdepth 1 -name \"*.sh\" -exec sbatch {} \\;'", "deny"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'which sbatch && cd {d} && sbatch {b}'", None),
+    # H3: variables assigned in the same command are resolved; others ask
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && JOB={b} && sbatch $JOB'", None),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && JOB={b} && sbatch \"$JOB\"'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && sbatch $JOB'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && OPTS=--gpus=5; sbatch $OPTS {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && sbatch --gpus=$NG {b}'", "ask"),
+    # H4: Slurm GPU forms
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch -G4 {b}'", None),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --gres gpu:2 -N2 {b}'", None),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --tres-per-job=gres/gpu:5 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --gres=gpu:a40:2,gpu:a100:3 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --gpus=a40:2,a100:3 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --nodes=1-4 --gres=gpu:2 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --ntasks-per-node=8 --gpus-per-task=1 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --nodes=1 --sockets-per-node=2 --gpus-per-socket=4 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch -w node[01-03] --gres=gpu:2 {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --part=mlgpu_long -J newrun {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH --gpus-per-n=3\n#SBATCH --nodes=2", "ssh marvin 'cd {d} && sbatch {b}'", "ask"),
+    # H5: environment, stdin, heterogeneous jobs, words after the script name
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && SBATCH_GPUS=5 sbatch {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && export SBATCH_GPUS=5 && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && env SBATCH_GRES=gpu:5 sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cat {f} | sbatch'", "ask"),
+    (REMOTE, "", 0, None, "ssh marvin 'sbatch <<EOF\n#!/bin/bash\n#SBATCH -p mlgpu_devel\n#SBATCH --gpus=6\nsrun true\nEOF'", "ask"),
+    (REMOTE, "", 0, None, "ssh marvin 'sbatch <<EOF\n#!/bin/bash\n#SBATCH -p mlgpu_devel\n#SBATCH --gpus=1\nsrun true\nEOF'", None),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && sbatch < {b}'", "ask"),
+    (REMOTE, "", 0, SBATCH % "", "ssh marvin 'cd {d} && sbatch --gpus=3 : --gpus=3 {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && sbatch {b} --lr 0.1 --gpus 8'", None),       # script arguments
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && sbatch {b} --gpus=1'", "ask"),
+    (REMOTE, "", 0, SBATCH % "#SBATCH --gpus=1\nmodule load x\n#SBATCH --gpus=8", "ssh marvin 'cd {d} && sbatch {b}'", None),
+    (REMOTE, "", 0, G(5), "ssh marvin 'cd {d} && sbatch --test-only {b}'", None),                # nothing is submitted
+    (REMOTE, "", 0, G(2), "ssh marvin 'cd {d} && sbatch --gres=gpu:1 {b}'", "ask"),              # two GPU option kinds
+    # H6: HTCondor submit descriptions
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nqueue 1\nqueue 1\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nqueue 1\nrequest_gpus = 2\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nqueue 11\nqueue 11\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nqueue 2 s in (a b)\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nqueue s in (a b)\n", "ssh baf 'cd {d} && condor_submit {b}'", None),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nN = 3\nqueue $(N)\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\n", "ssh baf 'cd {d} && condor_submit {b} -queue 3'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\ninclude : common.sub\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nJobBatchName = t\nMY.MaxRuntimeHours = 100\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nJobBatchName = t\n+MaxRuntimeHours = 24*7\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nhold = True\nqueue 1\n", "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    (REMOTE, "", 0, "executable = r.sh\nrequest_gpus = 1\nqueue 1\nrequest_gpus = 4\n", "ssh baf 'cd {d} && condor_submit {b}'", None),
+    (REMOTE, "", 0, JDL % (3, "", "1"), "ssh baf 'cd {d} && cat {b} | condor_submit'", "ask"),
+    (REMOTE, "", 0, None, "ssh baf 'condor_submit <<EOF\nexecutable = r.sh\nrequest_gpus = 3\nqueue 1\nEOF'", "ask"),
+    (REMOTE, "", 0, None, "ssh baf 'condor_submit <<EOF\nexecutable = r.sh\nrequest_gpus = 1\nqueue 1\nEOF'", None),
+    (REMOTE, "2 2.0\n", 0, JDL % (1, "", "1"), "ssh baf 'cd {d} && condor_submit {b}'", "ask"),
+    # H7: tools that may replace the job file without naming it
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && git pull && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && git status --short; sbatch {b}'", None),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && tar xf jobs.tar && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && ./make_jobs.sh && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && cp ../templates/*.sh . && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && module load Miniforge3 && rm -f slurm-*.out && sbatch {b}'", None),
+    (REMOTE, "", 0, G(1), "rsync -a {d}/ marvin:{d}/ && ssh marvin 'cd {d} && sbatch {b}'", "ask"),
+    (REMOTE, "", 0, G(1), "ssh marvin 'cd {d} && sbatch {b} && git log -1'", None),               # after the submit
+    # a script that submits is found by reading it
+    (REMOTE, "", 0, "#!/bin/bash\nsbatch a.sh\nsbatch b.sh\n", "ssh marvin 'cd {d} && bash {b}'", "ask"),
+    (REMOTE, "", 0, "#!/bin/bash\necho hello\n", "ssh marvin 'cd {d} && bash {b}'", None),
+    # H8: login-node rules behind runners, quoted watch, loops, bulk copies
+    (LOCAL, "", 0, None, "ssh marvin 'conda run -n ml torchrun train.py'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'uv run torchrun train.py'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'tmux new -d \"torchrun train.py\"'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'screen -dm torchrun train.py'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'mpirun.openmpi -np 4 ./a.out'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'jupyter --version'", None),
+    (LOCAL, "", 0, None, "ssh marvin 'conda activate ml && python -V'", None),
+    (LOCAL, "", 0, None, "ssh marvin 'watch -n1 \"squeue --me\"'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'squeue --me -i 5'", "deny"),
+    (LOCAL, "", 0, None, "ssh baf 'condor_watch_q'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'while squeue -j 123 | grep -q 123; do sleep 10; done'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'for i in $(seq 100); do sacct -j 123; sleep 2; done'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'while :; do scontrol show job 123 | grep JobState; sleep 3; done'", "deny"),
+    (LOCAL, "", 0, None, "while true; do ssh marvin squeue --me; sleep 10; done", "deny"),
+    (LOCAL, "", 0, None, "while true; do ssh marvin squeue --me; sleep 300; done", None),
+    (LOCAL, "", 0, None, "watch -n 10 ssh marvin squeue --me", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'sleep 5; squeue --me; sleep 5; squeue --me; sleep 5; squeue --me'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'cd /lustre/scratch/data && find . -name \"*.pt\"'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'cd /lustre/scratch && du -sh *'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'WS=/lustre/scratch/data; find $WS -name \"*.pt\"'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'cp -r /lustre/scratch/data /lustre/mlnvme/'", "deny"),
+    (LOCAL, "", 0, None, "ssh marvin 'tar czf all.tgz /lustre/scratch/data'", "deny"),
+    (LOCAL, "", 0, None, "ssh baf 'du -sh $BUDDY'", "ask"),
+    (LOCAL, "", 0, None, "ssh baf 'bash -lc \"ls -ld \\$BUDDY\"'", None),
     # removing jobs: own tagged jobs pass, everything else asks
     (CONFIRM, "123|claude-agent\n", 0, None, "scancel 123", None),
     (CONFIRM, "123_1|claude-agent\n123_2|claude-agent\n", 0, None, "scancel 123", None),
@@ -258,7 +365,7 @@ def main():
         if content is not None:
             with open(os.path.join(workdir, name), "w") as fh:
                 fh.write(content)
-        command = command.format(f=os.path.join(workdir, name), d=workdir, b=name)
+        command = command.replace("{f}", os.path.join(workdir, name)).replace("{d}", workdir).replace("{b}", name)
         env = dict(ctx, PATH=bindir + os.pathsep + os.environ["PATH"], FAKE_HELD=held, FAKE_QUEUED=str(queued))
         got = run(env, command)
         if got != expected:

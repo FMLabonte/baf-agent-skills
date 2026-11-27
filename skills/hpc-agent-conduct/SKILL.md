@@ -169,36 +169,54 @@ quota.
 ### Write submit commands the guard hook can read
 
 The guard hook checks every submission **before the command runs**: it reads
-the job file to count GPUs, tasks and runtime. A command it cannot read is
-sent to the user for approval even when the job is small, which stops
-autonomous work. Shape submissions so they pass on their own:
+the command and the job file to count GPUs, tasks and runtime. Its rule is
+simple: **it lets a submission through only if it understood all of it;
+anything else goes to the user**, even when the job is small, which stops
+autonomous work. So submit in the one plain shape it reads without
+guessing:
 
-- **The job file must exist before the submitting command runs.** Create,
-  edit, copy or generate it in one tool call (Write, `scp`, `sed`, `cp`, ...),
-  and submit in the **next** call. Never `sed ... > job.jdl && condor_submit
-  job.jdl`, `cp a.sh job.sh && sbatch job.sh` or `python gen.py && sbatch
-  job.sh` in one command: the hook treats a file changed by the same command
-  as unknown and asks.
-- Two same-command forms the hook can read: a **here-document** that writes
-  the file (`cat > job.jdl <<'EOF' ... EOF`, then submit), or an `scp`/`rsync`
-  of an **unchanged local file** followed by the submit (the hook reads the
-  local copy).
-- **Literal resource numbers** in the file or on the command line:
-  `request_gpus = 1`, `--gpus=1`, `queue 10`. No `$(N)` macros or shell
-  variables for GPUs, tasks or `MaxRuntimeHours`.
-- **One submit per command**, never in a loop (use an array or `queue N`
-  with a cap). Name the file explicitly: `cd <dir> && condor_submit job.jdl`
-  or an absolute path, inside or outside `bash -lc "..."`.
-- Keep other work (copying outputs, waiting, reading logs) out of the
-  submitting command where you can; a short submit command is easy for the
-  user to review if it does get asked.
+```bash
+ssh marvin 'cd <dir> && sbatch job.sh'
+ssh baf 'bash -lc "cd <dir> && condor_submit job.jdl"'
+```
+
+- **The submit is a plain command of its own.** Not inside `if`/`then`,
+  `{ }`, a function, backticks, `echo "$(sbatch ...)"`, `tmux`/`screen`, or a
+  variable holding the command. To capture the job ID, read the command's
+  output (`sbatch --parsable job.sh` prints it); do not wrap the submit.
+- **Never submit from inside a script** (`submit_all.sh`, a Python launcher).
+  The hook reads scripts you run on the cluster and asks if they submit.
+- **The job file exists and is final before the submitting command runs.**
+  Create, edit, copy, generate or `git pull` it in one tool call, and submit
+  in the **next**. In the same command, only harmless steps may come before
+  the submit (`cd`, `module load`, `mkdir`, `chmod`, `rm` of old logs,
+  `git status`). Two same-command forms are read: a **here-document** that
+  writes the file (`cat > job.jdl <<'EOF' ... EOF`, then submit), and an
+  `scp`/`rsync` of **one unchanged local file** followed by the submit.
+- **Literal values, standard spelling.** No shell variables or wildcards in
+  the submit command (a variable assigned earlier in the same command is
+  fine), no `SBATCH_*` environment variables, no abbreviated options
+  (`--partition`, not `--part`). Put the script name last: everything after
+  it is passed to the script, not to `sbatch`.
+- **One way to ask for GPUs.** Slurm: exactly one of `--gpus=N`,
+  `--gres=gpu:N` (times `--nodes`), `--gpus-per-node` with `--nodes`, or
+  `--gpus-per-task` with `--ntasks`; a single node count, no ranges or node
+  lists. The hook does not read `--tres-per-*`, `--gpus-per-socket` or
+  heterogeneous jobs and asks. HTCondor: `request_gpus = N`,
+  `+MaxRuntimeHours = N` and `queue N` as plain integers in the file; no
+  `include`, no macros for these, no `-queue` on the command line, no
+  `hold = True`.
+- **Several submits in one command are added up** against the limits. One
+  submit per command is easiest to read and to approve; never in a loop (use
+  an array or `queue N` with a cap).
 
 When the hook asks anyway, read its reason before involving the user:
 
-- *"written or changed by this same command"*, *"Could not read from the
-  submit file ..."* or *"Could not work out how many GPUs ..."*: your command
-  shape is the problem (or the file is missing, or uses a macro for GPUs). Split it as above and
-  retry; do not ask the user to approve it.
+- *"appears where the hook cannot read it"*, *"cannot work out what this
+  submission requests"*, *"written or changed by this same command"*,
+  *"runs before the submit in the same command"*, *"submits jobs itself"*:
+  your command's shape is the problem. Rewrite it as above and retry; do not
+  ask the user to approve it.
 - *"Could not check how many jobs and GPUs you already have/hold"*: the hook
   could not reach the scheduler at all. That is neither your command's shape
   nor a limit, so retrying or splitting will not help. Check the connection

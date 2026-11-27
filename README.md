@@ -103,7 +103,7 @@ flowchart TD
 ## 4. What is enforced by the program
 
 Applies to commands sent to BAF over `ssh`. Source: [`hooks/hpc_guard.py`](hooks/hpc_guard.py);
-its 174 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
+its 270 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
 
 | The agent tries to | Result |
 |---|---|
@@ -125,8 +125,11 @@ its 174 test cases are in [`hooks/test_hpc_guard.py`](hooks/test_hpc_guard.py).
 The same checks apply on every line of a multi-line command, in scripts
 passed to a remote shell by here-document, to job files copied over with
 `scp`/`rsync` in the same command, inside `bash -c` / `bash -lc` and behind wrappers such
-as `nohup`, `env`, `nice` and `timeout`. If the hook cannot query the
-scheduler, it asks the user.
+as `nohup`, `env`, `nice` and `timeout`. The hook
+fails closed: a submission passes without a prompt only when the hook has
+read the whole command and every job file in it. Several submits in one
+command are added up, and anything it cannot read or count asks the user, as
+does a failure to query the scheduler.
 
 **Scheduler queries the hook itself makes:** one
 `condor_q -global $USER -af JobStatus RequestGPUs` per submission; one
