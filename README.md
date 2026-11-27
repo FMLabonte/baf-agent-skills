@@ -1,5 +1,12 @@
 # HPC agent skills: review copy for the BAF / PHY-IT team
 
+> **Status: under review, not for general use yet.** This version covers only
+> GPU work, for one group. Please do not pass it on to other BAF users or
+> install it for regular work until it also has guidelines for CPU-heavy
+> jobs, and until it is clear that agents using it will not flood BAF and
+> its few GPU machines, which the skill points out by name. It is public
+> only so that the BAF / PHY-IT team can read it easily.
+
 **Why you are getting this.** People have started to use AI coding agents
 for their work on the clusters. An agent that does not know what it should
 and should not do on a shared system can cause real problems. In AG Flek

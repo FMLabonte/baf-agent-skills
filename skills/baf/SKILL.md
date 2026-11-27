@@ -5,6 +5,12 @@ description: Site knowledge for BAF, the Bonn Analysis Facility at the Physikali
 
 # BAF (Bonn Analysis Facility)
 
+**Status: under review, GPU work only.** This skill was written for one
+group's GPU jobs and has no guidance yet for CPU-heavy work. If the user is
+not a member of that group (AG Flek), say so before the first BAF command and
+ask whether their group has agreed its own limits; do not assume the GPU
+budget below applies to them. BAF has three GPU machines for everyone.
+
 Sources, read 2026-11-25:
 
 - The group's guide and templates: `docs/baf/` in
